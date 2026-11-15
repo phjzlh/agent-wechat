@@ -6,10 +6,12 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { makePrivateTestDirectory } from "./support/private-directory.mjs";
 
 test("two private preview hubs keep credentials separate and remain selectable when one is offline", { timeout: 25000 }, async t => {
   const directory = await mkdtemp(join(tmpdir(), "preview-hubs-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+  makePrivateTestDirectory(directory);
   const requests = [];
   const servers = [];
   const targets = [];
@@ -39,7 +41,7 @@ test("two private preview hubs keep credentials separate and remain selectable w
   const reservation = createServer(); await new Promise(resolve => reservation.listen(0, "127.0.0.1", resolve));
   const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
   const child = spawn(process.execPath, [fileURLToPath(new URL("../scripts/connect.mjs", import.meta.url)), "--connections-file", config, "--state-dir", directory], {
-    env: { PATH: process.env.PATH, HOME: directory, CLIENT_UI_PORT: String(port), CLIENT_UI_ORIGIN: "" }, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, CLIENT_UI_PORT: String(port), CLIENT_UI_ORIGIN: "" }, stdio: ["ignore", "pipe", "pipe"],
   });
   t.after(async () => {
     if (child.exitCode !== null || child.signalCode !== null) return;

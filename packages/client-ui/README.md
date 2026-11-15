@@ -123,6 +123,10 @@ sign-in, sign-out and confirmed removal use the normal account API. The daemon's
 existing token checks still apply; no frontend role or special management mode is
 introduced. Token and daemon-management routes remain blocked by the proxy.
 
+On Windows, use a directory you own for `--state-dir`. The directory and its
+files must grant access only to your Windows account and SYSTEM. Keep the same
+permissions on the connection key file.
+
 The launcher accepts `CLIENT_UI_PORT` and HTTPS `CLIENT_UI_ORIGIN`. Keep the printed
 fragment link private. Closing the launcher leaves the external daemon running.
 `node scripts/client-ui-connect-smoke.mjs` checks the proxy with a local HTTP fixture.

@@ -1,10 +1,11 @@
 // Explicit browser connection to an existing hub. Never starts/stops a daemon.
-import { readFile, writeFile, mkdir, lstat } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { createServer } from "vite";
 import { NativeWeChatClient, validateNativeBaseUrl } from "@agent-wechat/shared";
+import { loadPreviewSecret, readPrivateText, requirePrivateDirectory } from "./private-preview-path.mjs";
 
 const argument = (name) => {
   const index = process.argv.indexOf(name);
@@ -24,11 +25,7 @@ process.once("SIGINT", () => void stop());
 process.once("SIGTERM", () => void stop());
 try {
   const multiple = process.argv.includes("--connections-file");
-  const privateText = async (path) => {
-    const info = await lstat(path);
-    if (!info.isFile() || info.mode & 0o077 || info.size > 32768) throw new Error("Use an owner-only connection file");
-    return readFile(path, "utf8");
-  };
+  const privateText = (path) => readPrivateText(path, "Use an owner-only connection file");
   const targets = multiple ? JSON.parse(await privateText(resolve(argument("--connections-file")))) : [{ id: "default", name: "Hub", server: argument("--server"), tokenFile: resolve(argument("--token-file")) }];
   if (!Array.isArray(targets) || !targets.length || targets.length > 8) throw new Error("Configure between one and eight preview hubs");
   const hubs = new Map();
@@ -57,19 +54,10 @@ try {
     if (account && !accounts.items.some((item) => item.id === account)) throw new Error("Account not available with this token");
   }
   await mkdir(state, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32")
+    await requirePrivateDirectory(state, "Use an owner-only preview state directory");
   const secretFile = join(state, "ui-connect-secret");
-  try {
-    await writeFile(secretFile, randomBytes(32).toString("hex"), {
-      mode: 0o600,
-      flag: "wx",
-    });
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-  const info = await lstat(secretFile);
-  if (!info.isFile() || info.mode & 0o077)
-    throw new Error("Use an owner-only preview secret file");
-  const secret = (await readFile(secretFile, "utf8")).trim();
+  const secret = (await loadPreviewSecret(secretFile, "Use an owner-only preview secret file")).trim();
   if (!/^[0-9a-f]{64}$/.test(secret)) throw new Error("Invalid preview secret");
   const equal = (value) =>
     typeof value === "string" &&

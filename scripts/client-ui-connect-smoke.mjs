@@ -1,10 +1,12 @@
 // Explicit-connect launcher checks against a local HTTP fixture, never WeChat.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { loadPreviewSecret, readPrivateText, requirePrivateDirectory } from "../packages/client-ui/scripts/private-preview-path.mjs";
+import { makePrivateTestDirectory } from "../packages/client-ui/test/support/private-directory.mjs";
 
 const data = await mkdtemp(join(tmpdir(), "agentwechat-connect-test-"));
 const token = "synthetic-browser-token";
@@ -25,6 +27,29 @@ const backend = createServer((req, res) => {
 });
 try {
   await new Promise((done) => backend.listen(0, "127.0.0.1", done));
+  if (process.platform === "win32") {
+    makePrivateTestDirectory(data);
+    const loose = join(data, "loose");
+    await writeFile(loose, token);
+    execFileSync("icacls.exe", [loose, "/grant", "*S-1-1-0:R"]);
+    await assert.rejects(
+      readPrivateText(loose, "Use an owner-only connection file"),
+      /owner-only connection file/,
+    );
+    await assert.rejects(loadPreviewSecret(loose, "Private secret required"), /Private secret required/);
+    assert.equal(await readFile(loose, "utf8"), token, "an existing file must never be overwritten");
+
+    // A private directory can grant rights that do not inherit to new files.
+    const noInheritance = join(data, "no-inherited-file-rights");
+    await mkdir(noInheritance);
+    makePrivateTestDirectory(noInheritance, { inherit: false });
+    await requirePrivateDirectory(noInheritance, "Private directory required");
+    const generated = join(noInheritance, "secret");
+    const value = await loadPreviewSecret(generated, "Private secret required");
+    assert.match(value, /^[0-9a-f]{64}$/);
+    assert.equal(await readPrivateText(generated, "Private secret required"), value);
+    assert.equal(await loadPreviewSecret(generated, "Private secret required"), value);
+  }
   const tokenFile = join(data, "token");
   await writeFile(tokenFile, token, { mode: 0o600 });
   const reservation = createServer();
