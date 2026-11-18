@@ -29,8 +29,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs cover each OS; releases/manual runs cover all five platforms.
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"runner":"macos-latest","target":"aarch64-apple-darwin","platform":"macos-arm64"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","platform":"windows-x64"},{"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64"}]' || '[{"runner":"macos-latest","target":"aarch64-apple-darwin","platform":"macos-arm64"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","platform":"windows-x64"},{"runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","platform":"windows-arm64"},{"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64"},{"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-arm64"}]') }}
+        # PRs and Native distribution's main-branch runs cover each OS; releases
+        # and manual runs cover all five platforms. Those main-branch runs only
+        # build CLI artifacts for these three.
+        include: ${{ fromJSON(!(inputs.release || github.event_name == 'workflow_dispatch') && '[{"runner":"macos-latest","target":"aarch64-apple-darwin","platform":"macos-arm64"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","platform":"windows-x64"},{"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64"}]' || '[{"runner":"macos-latest","target":"aarch64-apple-darwin","platform":"macos-arm64"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","platform":"windows-x64"},{"runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","platform":"windows-arm64"},{"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64"},{"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
@@ -53,19 +55,24 @@ jobs:
           toolchain: 1.93.1
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
-      - name: Install Linux desktop prerequisites
+      - name: Select the Ubuntu package mirror
         if: runner.os == 'Linux'
         run: |
           # Avoid the Azure mirror's very slow package downloads on x64 runners.
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
             sudo sed -i 's#http://azure.archive.ubuntu.com/ubuntu#https://archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list.d/ubuntu.sources
           fi
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libpulse-dev patchelf dbus-x11 gnome-keyring xvfb x11-utils webkit2gtk-driver python3-dbus python3-gi
+      # About 80 MB in 200 packages. Mirror stalls have stretched this from one
+      # minute to ten, so main-branch runs cache the files and PRs reuse them.
+      - name: Install Linux desktop prerequisites
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev libpulse-dev patchelf dbus-x11 gnome-keyring xvfb x11-utils webkit2gtk-driver python3-dbus python3-gi
       - name: Select native Windows compiler
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/native-ci-msvc.ps1
+        run: ./scripts/ci/msvc.ps1
       - name: Select Windows Perl
         if: runner.os == 'Windows'
         shell: pwsh
@@ -86,6 +93,9 @@ jobs:
           add-rust-environment-hash-key: false
           key: desktop-v3-${{ matrix.runner }}-${{ matrix.target }}-${{ steps.rust.outputs.cachekey }}-${{ env.VCToolsVersion }}-${{ env.WindowsSDKVersion }}-${{ env.RUSTFLAGS }}-debug${{ env.CARGO_PROFILE_DEV_DEBUG }}-${{ env.CARGO_PROFILE_TEST_DEBUG }}
           cache-on-failure: true
+          # Native distribution's main-branch runs save this; PRs read it. The
+          # standalone CLI cache above keeps saving from PRs: no main run fills it.
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: pnpm install --frozen-lockfile --filter @agent-wechat/desktop...
       - run: pnpm --filter @agent-wechat/desktop build
       - run: pnpm --filter @agent-wechat/shared build
@@ -97,7 +107,7 @@ jobs:
           path: ${{ runner.temp }}/native-cli-artifact
       - name: Require matching CLI source, compiler, target, flags and checksum
         if: inputs.native_artifact_prefix != ''
-        run: node scripts/native-ci-artifact.mjs restore "$RUNNER_TEMP/native-cli-artifact"
+        run: node scripts/ci/artifact.mjs restore "$RUNNER_TEMP/native-cli-artifact"
       - name: Build native CLI
         if: inputs.native_artifact_prefix == '' && runner.os != 'Windows'
         run: cargo build --release --locked --manifest-path packages/native-client-rust/Cargo.toml --target ${{ matrix.target }} -p wx-native

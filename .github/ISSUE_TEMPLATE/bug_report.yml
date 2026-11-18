@@ -1,0 +1,49 @@
+name: Bug report
+description: Something fails, gives the wrong result, or gets stuck.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful thing you can give us is a way to reproduce the problem, ideally one that doesn't need your account. Works but slowly? Use **Performance** instead.
+
+        Before posting, remove tokens, keys, wxids, phone numbers, names, message text, file IDs and URLs. Mask values but keep field names, like `"url": "<masked>"`. 中文也可以。
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands or clicks, starting from a known state. Say whether it happens every time.
+      placeholder: |
+        1. wx accounts create --alias test && wx auth login
+        2. wx messages send filehelper --file ./clip.mov
+        3. wx --json jobs get <job-id>
+    validations:
+      required: true
+
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened, and what did you expect?
+      description: Paste the exact error or `--json` output. If the official WeChat app handles the same thing correctly, say so.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - agent-wechat version (`wx version`):
+        - Installed with (npm, release binary, Docker, desktop app, OpenClaw managed mode, source):
+        - OS and architecture:
+        - Logged in with (`wx auth login`, or `--official`):
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: Relevant lines from `wx accounts status`, `wx daemon logs`, or the Docker or systemd log.
+      render: shell

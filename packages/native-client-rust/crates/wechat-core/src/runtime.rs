@@ -1,5 +1,15 @@
+#[path = "contact_classification.rs"]
+mod contact_classification;
+#[path = "contact_privacy_state.rs"]
+mod contact_privacy_state;
+#[path = "contact_requests.rs"]
+pub(crate) mod contact_requests;
+pub use contact_requests::{ContactMutation, ContactRequestQuery, ContactUpdate};
+pub use wechat_protocol::ContactPrivacySettings;
 #[path = "checkpoint.rs"]
 mod checkpoint;
+#[path = "contact_remarks.rs"]
+mod contact_remarks;
 #[path = "contact_sync.rs"]
 mod contact_sync;
 #[path = "groups.rs"]
@@ -60,6 +70,9 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 use wechat_protocol::{AccountState, DeviceProfile, LoginStatus, NativeOptions};
 use wechat_store::{vault::Vault, Operation, SendIntent, Store};
+
+// Limit how many commands the writer can apply without releasing the account lock.
+const SYNC_REPLAY_CHUNK_SIZE: usize = 8;
 
 fn contact_lookup_item(contact: &wechat_protocol::wire::ContactRecord) -> Value {
     let display_name = [contact.remark.as_deref(), contact.nickname.as_deref()]
@@ -154,6 +167,9 @@ pub struct CoreShared {
     pub(crate) official_profiles: AsyncMutex<()>,
     pub stopping: AtomicBool,
     pub(crate) read_pools: Mutex<BTreeMap<String, Arc<crate::read_view::ReadPool>>>,
+    /// Attachments whose whole content was checked, so a byte range of them can
+    /// be served without reading the rest; see `media_content_stream`.
+    pub(crate) verified_content: Mutex<crate::media::VerifiedContent>,
 }
 pub(crate) struct DownloadPermit {
     _account: tokio::sync::OwnedSemaphorePermit,
@@ -393,6 +409,7 @@ impl Core {
                 official_profiles: AsyncMutex::new(()),
                 stopping: AtomicBool::new(false),
                 read_pools: Mutex::new(BTreeMap::new()),
+                verified_content: Mutex::new(Default::default()),
             }),
         });
         for account in core.store.accounts()? {
@@ -403,6 +420,7 @@ impl Core {
             core.store.recover_media_jobs(&account.id)?;
             core.store.recover_message_recalls(&account.id)?;
             core.store.recover_group_mutations(&account.id)?;
+            core.store.recover_contact_mutations(&account.id)?;
             core.recover_logout(&account.id)?;
             core.store.recover_interrupted_operations(&account.id)?;
             core.store.recover_call_sessions(&account.id)?;
@@ -414,6 +432,7 @@ impl Core {
             let _ = core.recover_saved_login(&account.id);
             let _ = core.recover_outgoing_recall_projections(&account.id);
             let _ = core.repair_group_mutations(&account.id);
+            let _ = core.repair_contact_mutations(&account.id);
             let _ = core.refresh_incoming_groups(&account.id, false);
         }
         Ok(core)
@@ -561,6 +580,14 @@ impl Core {
     }
     pub async fn lock_account(&self, account: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         Ok(self.gate(account)?.lock_owned().await)
+    }
+    /// Take this before the account lock and keep it across yields so only one
+    /// task can advance the receive cursor and replay its commands.
+    pub(super) async fn lock_sync_replay(
+        &self,
+        account: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        self.lock_operation(account, "sync_replay").await
     }
     pub(crate) async fn download_permit(&self, account: &str) -> Result<DownloadPermit> {
         self.store.account(account)?;
@@ -812,6 +839,9 @@ impl Core {
         let mut op = self.store.operation(account, id)?;
         if op.kind == "message_recall" {
             bail!("operation_cannot_cancel");
+        }
+        if op.kind == "contact_mutation" {
+            return self.store.cancel_contact_mutation(account, id);
         }
         if op.kind == "group_mutation" {
             return self.store.cancel_group_mutation(account, id);
@@ -1270,10 +1300,12 @@ impl Core {
             .await
     }
     async fn sync_session(self: &Arc<Self>, account: &str, fence: SessionFence) -> Result<Value> {
+        let replay = self.lock_sync_replay(account).await?;
         let guard = self.lock_account(account).await?;
         let core = self.clone();
         let account = account.to_owned();
         blocking(move || {
+            let _replay = replay;
             let mut permit = crate::account_network::AccountNetworkPermit {
                 guard: Some(guard),
                 runtime: tokio::runtime::Handle::current(),
@@ -1295,9 +1327,47 @@ impl Core {
             )?;
 
             core.bind_call_authorization(&account, &state)?;
-            core.commit_sync_batch(&account, batch, "shortlink", "manual_or_fallback")
+            // A sync response can rotate credentials. Fence replay against the accepted state.
+            let replay_fence = core.session_fence(&account)?;
+            core.commit_sync_batch_with_yield(
+                &account,
+                batch,
+                "shortlink",
+                "manual_or_fallback",
+                Some(&mut || {
+                    core.yield_sync_writer(&account, &mut permit, &replay_fence, desired.as_deref())
+                }),
+            )
         })
         .await
+    }
+
+    /// Rejoin the account lock queue and revalidate the session before writing again.
+    pub(super) fn yield_sync_writer(
+        &self,
+        account: &str,
+        permit: &mut crate::account_network::AccountNetworkPermit,
+        fence: &SessionFence,
+        desired: Option<&[u8]>,
+    ) -> Result<()> {
+        permit.transfer(self, account, || Ok(()))?;
+        self.check_sync_replay_session(account, fence, desired)
+    }
+
+    /// Reject replay from a writer superseded by logout, disconnect or reauthentication.
+    fn check_sync_replay_session(
+        &self,
+        account: &str,
+        fence: &SessionFence,
+        desired: Option<&[u8]>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.stopping.load(Ordering::SeqCst)
+                && self.store.runtime(account, "desired")?.as_deref() == desired,
+            "session_superseded"
+        );
+        self.session_state(account, fence)?;
+        Ok(())
     }
     pub async fn lookup_contacts(
         self: &Arc<Self>,
@@ -1914,37 +1984,83 @@ impl Core {
         Ok(done)
     }
     pub fn recover_projection(&self, account: &str) -> Result<Value> {
+        self.prepare_projection_recovery(account)?;
+        self.project_pending(account)
+    }
+
+    /// Serialize online recovery with sync and allow queued reads between chunks.
+    pub async fn recover_projection_online(self: &Arc<Self>, account: &str) -> Result<Value> {
+        let replay = self.lock_sync_replay(account).await?;
+        let guard = self.lock_account(account).await?;
+        let core = self.clone();
+        let account = account.to_owned();
+        blocking(move || {
+            let _replay = replay;
+            let mut permit = crate::account_network::AccountNetworkPermit {
+                guard: Some(guard),
+                runtime: tokio::runtime::Handle::current(),
+            };
+            let fence = core.session_fence(&account)?;
+            let desired = core.store.runtime(&account, "desired")?;
+            core.prepare_projection_recovery(&account)?;
+            core.project_pending_with_yield(
+                &account,
+                false,
+                Some(&mut || {
+                    core.yield_sync_writer(&account, &mut permit, &fence, desired.as_deref())
+                }),
+            )
+        })
+        .await
+    }
+
+    /// Keep online and offline recovery in the same order.
+    fn prepare_projection_recovery(&self, account: &str) -> Result<()> {
         self.repair_group_mutations(account)?;
+        self.repair_contact_mutations(account)?;
         self.refresh_incoming_groups(account, false)?;
         if self.store.pending_sync(account)?.is_empty() {
             self.store.retry_blocked(account)?;
         }
-        self.project_pending(account)
+        Ok(())
     }
     fn project_pending(&self, account: &str) -> Result<Value> {
-        self.project_pending_with_media(account, false)
+        self.project_pending_with_yield(account, false, None)
     }
-    pub(crate) fn project_pending_with_media(
+
+    /// Finish each command and its receipt within one chunk so recovery can skip it.
+    pub(super) fn project_pending_with_yield(
         &self,
         account: &str,
         download_voice: bool,
+        mut yield_writer: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Value> {
         let mut projected = 0;
         let mut unsupported = 0;
-        self.account_state(account)?;
+        let state = self.account_state(account)?;
         self.project_contact_pending(account)?;
         self.reconcile_recall_markers(account)?;
         let sent = self.recover_text_projections(account)?;
-        for (batch_id, encrypted) in self.store.pending_sync(account)? {
-            let plain =
-                self.vault
-                    .open_record(account, &format!("apply:{batch_id}"), &encrypted)?;
-            let batch: wechat_protocol::wire::SyncBatch = serde_json::from_slice(&plain)?;
-            let origin = self
-                .store
-                .runtime(account, &format!("apply-origin:{batch_id}"))?
-                .and_then(|v| String::from_utf8(v).ok())
-                .unwrap_or_else(|| "catchup".into());
+        let pending = self.store.pending_sync(account)?;
+        // Mask staged recalls before a queued reader can see their original content.
+        if yield_writer.is_some() {
+            self.mask_pending_sync_recalls(account, &pending, &state.own_username)?;
+        }
+        let mut commands_in_turn = 0;
+        // Small batches share the budget. Commands with receipts cost nothing.
+        let mut count_work = || -> Result<()> {
+            if commands_in_turn == SYNC_REPLAY_CHUNK_SIZE {
+                if let Some(yield_writer) = yield_writer.as_mut() {
+                    yield_writer()?;
+                }
+                commands_in_turn = 0;
+            }
+            commands_in_turn += 1;
+            Ok(())
+        };
+        for (batch_id, encrypted) in pending {
+            let batch = self.load_sync_batch(account, &batch_id, &encrypted)?;
+            let origin = self.sync_batch_origin(account, &batch_id)?;
             let mut complete = true;
             let mut blockers = Vec::new();
             let mut blocked_count = 0usize;
@@ -1953,6 +2069,7 @@ impl Core {
                 if self.store.runtime(account, &receipt)?.is_some() {
                     continue;
                 }
+                count_work()?;
                 let outcome = if download_voice {
                     self.apply_received_sync_command(account, command, &receipt, &origin)
                 } else {
@@ -1983,6 +2100,54 @@ impl Core {
         Ok(
             json!({"projectedCommands":projected,"projectedSends":sent,"pendingCommands":unsupported,"pendingBatches":self.store.pending_sync_count(account)?}),
         )
+    }
+
+    /// Open the original journal entry for both masking and replay.
+    fn load_sync_batch(
+        &self,
+        account: &str,
+        id: &str,
+        encrypted: &[u8],
+    ) -> Result<wechat_protocol::wire::SyncBatch> {
+        let plain = self
+            .vault
+            .open_record(account, &format!("apply:{id}"), encrypted)?;
+        Ok(serde_json::from_slice(&plain)?)
+    }
+
+    /// Mask recalls even when their commands are several batches beyond the first yield.
+    fn mask_pending_sync_recalls(
+        &self,
+        account: &str,
+        pending: &[(String, Vec<u8>)],
+        own: &str,
+    ) -> Result<()> {
+        // Open the reader on demand and drop it before native replay writes or yields.
+        let mut reader = None;
+        for (id, encrypted) in pending {
+            let batch = self.load_sync_batch(account, id, encrypted)?;
+            let origin = self.sync_batch_origin(account, id)?;
+            for (index, command) in batch.commands.iter().enumerate() {
+                self.mask_sync_recall_before_yield(
+                    account,
+                    command,
+                    &format!("projected:{id}:{index}"),
+                    own,
+                    &origin,
+                    &mut reader,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Use the batch origin for both staged masks and replay events.
+    fn sync_batch_origin(&self, account: &str, id: &str) -> Result<String> {
+        Ok(self
+            .store
+            .runtime(account, &format!("apply-origin:{id}"))?
+            .and_then(|value| String::from_utf8(value).ok())
+            .unwrap_or_else(|| "catchup".into()))
     }
     pub fn enable_profile_writes(
         &self,
@@ -2241,15 +2406,28 @@ impl Core {
             // The persistent connection owns account heartbeats and incoming
             // sync while healthy. Keep local recovery and queued sends moving;
             // a failed push connection immediately restores bounded polling.
+            let replay = self.lock_sync_replay(account).await?;
             let guard = self.lock_account(account).await?;
             let core = self.clone();
             let owned = account.to_owned();
             blocking(move || {
-                let _guard = guard;
+                let _replay = replay;
+                let mut permit = crate::account_network::AccountNetworkPermit {
+                    guard: Some(guard),
+                    runtime: tokio::runtime::Handle::current(),
+                };
+                core.session_state(&owned, &fence)?;
                 let _ = core.recover_text_projections(&owned)?;
                 if core.refresh_incoming_groups(&owned, true)? > 0 {
-                    core.project_pending(&owned)?;
+                    core.project_pending_with_yield(
+                        &owned,
+                        false,
+                        Some(&mut || {
+                            core.yield_sync_writer(&owned, &mut permit, &fence, Some(b"connected"))
+                        }),
+                    )?;
                 }
+                core.refresh_contact_remarks(&owned, true)?;
                 if core.store.pending_sync_count(&owned)? == 0 {
                     core.publish_profile_checkpoint(&owned)?;
                 }
@@ -2260,6 +2438,7 @@ impl Core {
             return Ok(5);
         }
         let heartbeat = {
+            let replay = self.lock_sync_replay(account).await?;
             let guard = self.lock_account(account).await?;
             let core = self.clone();
             let account = account.to_string();
@@ -2268,13 +2447,28 @@ impl Core {
                     guard: Some(guard),
                     runtime: tokio::runtime::Handle::current(),
                 };
+                core.session_state(&account, &fence)?;
                 let _ = core.recover_text_projections(&account)?;
                 if core.refresh_incoming_groups(&account, true)? > 0 {
-                    core.project_pending(&account)?;
+                    core.project_pending_with_yield(
+                        &account,
+                        false,
+                        Some(&mut || {
+                            core.yield_sync_writer(
+                                &account,
+                                &mut permit,
+                                &fence,
+                                Some(b"connected"),
+                            )
+                        }),
+                    )?;
                 }
+                core.refresh_contact_remarks(&account, true)?;
                 if core.store.pending_sync_count(&account)? == 0 {
                     let _ = core.publish_profile_checkpoint(&account);
                 }
+                // The heartbeat does not advance the replay journal, so release the replay lock before I/O.
+                drop(replay);
                 let expected = core
                     .store
                     .runtime(&account, "account-state")?
@@ -4552,7 +4746,7 @@ pub(crate) mod tests {
         core.install_login_state("fresh", &accepted, None).unwrap();
         let created = core.ensure_managed_profile("fresh", &accepted).unwrap();
         assert_eq!(created["state"], "created");
-        assert_eq!(created["databases"], 8);
+        assert_eq!(created["databases"], 9);
         assert!(store
             .runtime("fresh", "profile-bootstrap")
             .unwrap()

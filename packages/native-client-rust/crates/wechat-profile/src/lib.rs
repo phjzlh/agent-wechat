@@ -38,6 +38,8 @@
 //! record the caller has already saved; the crate neither creates that record nor
 //! proves its existence. Unrecognized layouts remain unsupported for writes.
 // API naming policy for future changes is recorded in this crate's AGENTS.md.
+mod contact_requests;
+pub use contact_requests::*;
 mod dat;
 mod images;
 mod initialize;
@@ -60,6 +62,7 @@ mod sticker_cache;
 mod stickers;
 pub use sticker_cache::*;
 mod thread_read;
+mod wal_conversion;
 mod writer;
 
 pub use dat::*;
@@ -79,6 +82,7 @@ pub use schema::*;
 pub use snapshot::{keys_from_agent_cache, keys_from_password, ProfileLocation, ReadOptions};
 pub use stickers::*;
 pub use thread_read::*;
+pub use wal_conversion::*;
 pub use writer::*;
 
 #[derive(Debug, thiserror::Error)]

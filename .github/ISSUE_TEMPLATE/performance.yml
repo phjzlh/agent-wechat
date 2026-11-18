@@ -1,0 +1,48 @@
+name: Performance
+description: Something works, but slowly, or uses too much CPU, memory or disk.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when something finishes but takes too long or uses too much. If it fails or never finishes, use **Bug report** instead. We need numbers we can reproduce.
+
+        Before posting, remove tokens, keys, wxids, phone numbers, names, message text, file IDs and URLs. 中文也可以。
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, with the sizes involved, such as how many messages were waiting, how large a file, or how many chats and contacts.
+      placeholder: |
+        1. Disconnect the account and send it 30 messages from another phone.
+        2. wx accounts connect
+        3. While it catches up, run wx messages list filehelper --limit 1 every 200 ms and time each call.
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurements
+    attributes:
+      label: How slow is it?
+      description: Timings or resource use over several runs, how you measured them, and what you expected. A baseline helps, such as an earlier version, a smaller input, or the official WeChat app.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - agent-wechat version (`wx version`):
+        - Installed with (npm, release binary, Docker, desktop app, OpenClaw managed mode, source):
+        - OS and architecture:
+        - Hardware and storage (CPU, RAM, disk, VM, WSL or container):
+    validations:
+      required: true
+
+  - type: textarea
+    id: breakdown
+    attributes:
+      label: Where the time goes (optional)
+      description: Per-step timings, profiler samples, or timestamps from the daemon log.

@@ -9,10 +9,13 @@ on:
       - 'packages/cli/**'
       - 'packages/shared/**'
       - 'packages/openclaw-extension/**'
-      - 'scripts/native-*'
+      - 'scripts/ci/**'
+      - 'scripts/release/**'
+      - 'scripts/smoke/**'
       - 'deploy/native/**'
       - '.github/workflows/native-*'
       - '.github/workflows/desktop.yml'
+      - '.github/actions/apt-install/**'
       - '.github/workflows/windows-signing.yml'
       - '.github/workflows/release.yml'
       - 'package.json'
@@ -22,6 +25,29 @@ on:
       - 'turbo.json'
       - '.cargo/config*'
       - '.dockerignore'
+  # PR runs only read the Rust and Docker caches, so main fills them when the
+  # dependencies, compiler, Dockerfile or these workflows change. The weekly
+  # run renews entries that GitHub deletes after seven days without a read.
+  push:
+    branches: [main]
+    paths:
+      - 'packages/native-client-rust/Cargo.lock'
+      - 'packages/native-client-rust/Cargo.toml'
+      - 'packages/native-client-rust/crates/*/Cargo.toml'
+      - 'packages/native-client-rust/**/.cargo/config*'
+      - 'packages/desktop/src-tauri/Cargo.lock'
+      - 'packages/desktop/src-tauri/Cargo.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/config*'
+      - 'deploy/native/Dockerfile'
+      - 'scripts/ci/cache-key*.py'
+      - '.github/workflows/native-distribution.yml'
+      - '.github/workflows/native-portable.yml'
+      - '.github/workflows/desktop.yml'
+      - '.github/actions/apt-install/**'
+      - 'scripts/ci/apt-reuse.py'
+  schedule:
+    - cron: '41 10 * * 0'
 permissions:
   contents: read
 concurrency:
@@ -33,13 +59,17 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    # Main-branch runs exist to fill the caches, so they build everything that
+    # has one and skip the OpenClaw smoke tests.
     outputs:
-      native: ${{ steps.filter.outputs.native }}
-      openclaw: ${{ steps.filter.outputs.openclaw }}
-      desktop: ${{ steps.filter.outputs.desktop }}
+      native: ${{ github.event_name != 'pull_request' || steps.filter.outputs.native == 'true' }}
+      openclaw: ${{ github.event_name == 'pull_request' && steps.filter.outputs.openclaw == 'true' }}
+      desktop: ${{ github.event_name != 'pull_request' || steps.filter.outputs.desktop == 'true' }}
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
       - uses: dorny/paths-filter@v4
+        if: github.event_name == 'pull_request'
         id: filter
         with:
           filters: |
@@ -47,19 +77,18 @@ jobs:
               - 'packages/native-client-rust/**'
               - 'packages/cli/**'
               - 'rust-toolchain.toml'
-              - 'scripts/native-build-release*'
-              - 'scripts/native-ci-*'
-              - 'scripts/native-cli-*'
-              - 'scripts/native-container-smoke.py'
-              - 'scripts/native-export-smoke.py'
-              - 'scripts/native-merge-release*'
-              - 'scripts/native-package-smoke.mjs'
-              - 'scripts/native-platform-smoke.mjs'
-              - 'scripts/native-portable-build.mjs'
-              - 'scripts/native-release-manifest.mjs'
-              - 'scripts/native-release-preflight*'
-              - 'scripts/native-service-verify.py'
-              - 'scripts/native-simulator-smoke.mjs'
+              - 'scripts/release/build*'
+              - 'scripts/ci/**'
+              - 'scripts/smoke/media-assertions*.mjs'
+              - 'scripts/smoke/container.py'
+              - 'scripts/release/merge*'
+              - 'scripts/smoke/package.mjs'
+              - 'scripts/smoke/platform.mjs'
+              - 'scripts/release/portable-build.mjs'
+              - 'scripts/release/manifest.mjs'
+              - 'scripts/release/preflight*'
+              - 'scripts/smoke/service.py'
+              - 'scripts/smoke/simulator.mjs'
               - 'deploy/native/**'
               - '.github/workflows/native-client.yml'
               - '.github/workflows/native-distribution.yml'
@@ -74,14 +103,6 @@ jobs:
             openclaw:
               - 'packages/openclaw-extension/**'
               - 'packages/shared/**'
-              - 'scripts/native-gateway-smoke.mjs'
-              - 'scripts/native-smoke-plugin.mjs'
-              - 'scripts/native-model-smoke.mjs'
-              - 'scripts/native-conference-model-smoke.mjs'
-              - 'scripts/native-media-model-smoke.mjs'
-              - 'scripts/native-history-model-smoke.mjs'
-              - 'scripts/native-recall-model-smoke.mjs'
-              - 'scripts/native-archive-tools-smoke.mjs'
               - '.github/workflows/native-distribution.yml'
               - 'package.json'
               - '.node-version'
@@ -89,9 +110,9 @@ jobs:
               - 'pnpm-workspace.yaml'
             desktop:
               - 'deploy/native/Dockerfile'
-              - 'scripts/native-build-release.sh'
-              - 'scripts/native-portable-build.mjs'
-              - 'scripts/native-release-manifest.mjs'
+              - 'scripts/release/build.sh'
+              - 'scripts/release/portable-build.mjs'
+              - 'scripts/release/manifest.mjs'
               - '.github/workflows/native-portable.yml'
               - '.github/workflows/native-release.yml'
               - 'packages/desktop/**'
@@ -99,8 +120,9 @@ jobs:
               - 'packages/shared/**'
               - 'packages/native-client-rust/**'
               - 'packages/cli/**'
-              - 'scripts/native-ci-*'
+              - 'scripts/ci/**'
               - '.github/workflows/desktop.yml'
+              - '.github/actions/apt-install/**'
               - '.github/workflows/windows-signing.yml'
               - '.github/workflows/native-distribution.yml'
               - 'rust-toolchain.toml'
@@ -137,16 +159,16 @@ jobs:
           SMOKE_SUITE: ${{ matrix.suite }}
         run: |
           case "$SMOKE_SUITE" in
-            model|media-model) node "scripts/native-${SMOKE_SUITE}-smoke.mjs" ;;
+            model|media-model) node "packages/openclaw-extension/test/smoke/${SMOKE_SUITE}.mjs" ;;
             voice-current)
-              OPENCLAW_TEST_SDK_ROOT="$RUNNER_TEMP/openclaw-voice-current/node_modules/openclaw" node scripts/native-conference-model-smoke.mjs
+              OPENCLAW_TEST_SDK_ROOT="$RUNNER_TEMP/openclaw-voice-current/node_modules/openclaw" node packages/openclaw-extension/test/smoke/conference-model.mjs
               ;;
             tools)
-              node scripts/native-gateway-smoke.mjs
-              node scripts/native-conference-model-smoke.mjs
-              node scripts/native-history-model-smoke.mjs
-              node scripts/native-recall-model-smoke.mjs
-              node scripts/native-archive-tools-smoke.mjs
+              node packages/openclaw-extension/test/smoke/gateway.mjs
+              node packages/openclaw-extension/test/smoke/conference-model.mjs
+              node packages/openclaw-extension/test/smoke/history-model.mjs
+              node packages/openclaw-extension/test/smoke/recall-model.mjs
+              node packages/openclaw-extension/test/smoke/archive-tools.mjs
               ;;
             *) echo "Unknown smoke suite: $SMOKE_SUITE" >&2; exit 1 ;;
           esac
@@ -188,26 +210,27 @@ jobs:
           tags: native-release-builder:ci
           labels: org.opencontainers.image.revision=${{ github.sha }}
           # Export this solve directly: the later runtime solve must not replace
-          # the executable target's cache records on a fresh builder.
+          # the executable target's cache records on a fresh builder. Only main
+          # exports it (2m12s per run); PRs read main's copy.
           cache-from: |
             type=gha,scope=native-linux-artifact-${{ runner.arch }}
             type=gha,scope=native-linux-${{ runner.arch }}
-          cache-to: type=gha,mode=max,scope=native-linux-artifact-${{ runner.arch }}
-      - run: bash scripts/native-build-release.sh
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope=native-linux-artifact-{0}', runner.arch) || '' }}
+      - run: bash scripts/release/build.sh
         env:
           NATIVE_RELEASE_BUILDER_IMAGE: native-release-builder:ci
           NATIVE_CI_ARTIFACT: true
-      - run: node scripts/native-package-smoke.mjs artifacts/native
+      - run: node scripts/smoke/package.mjs artifacts/native
       - name: Validate actual CLI lifecycle and account selection without a native login
         run: |
           VERSION=$(node -p "require('./packages/cli/package.json').version")
-          python3 scripts/native-cli-smoke.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
-          python3 scripts/native-cli-fixture-test.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
-          python3 scripts/native-export-smoke.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
+          python3 packages/native-client-rust/scripts/cli-smoke.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
+          python3 packages/native-client-rust/scripts/cli-fixture-test.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
+          python3 packages/native-client-rust/scripts/export-smoke.py "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
       - name: Validate real managed/external OpenClaw hosting without account credentials
         run: |
           VERSION=$(node -p "require('./packages/cli/package.json').version")
-          node --experimental-strip-types scripts/native-openclaw-smoke.mjs "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
+          node --experimental-strip-types packages/openclaw-extension/test/smoke/host.mjs "artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
       - name: Build standalone image without publishing or starting a service
         uses: docker/build-push-action@v7.4.0
         with:
@@ -217,20 +240,22 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: agent-wechat-native:ci
+          # No export: the builder layers come from the artifact scope above, and
+          # the runtime layer takes about 20 seconds. The native-linux scope
+          # belongs to release builds.
           cache-from: |
             type=gha,scope=native-linux-artifact-${{ runner.arch }}
             type=gha,scope=native-linux-${{ runner.arch }}
-          cache-to: type=gha,mode=max,scope=native-linux-${{ runner.arch }}
       - name: Check image identity without touching account data
         run: docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges agent-wechat-native:ci --json version
-      - run: python3 scripts/native-container-smoke.py agent-wechat-native:ci
+      - run: python3 scripts/smoke/container.py agent-wechat-native:ci
       - name: Validate deployment examples without applying them
         run: |
           mkdir -p deploy/native/secrets
           printf 'validation-placeholder-not-a-real-secret\n' > deploy/native/secrets/api-token
           docker compose -f deploy/native/compose.yaml config --quiet
           VERSION=$(node -p "require('./packages/cli/package.json').version")
-          python3 scripts/native-service-verify.py "$PWD/artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
+          python3 scripts/smoke/service.py "$PWD/artifacts/native/wx-v${VERSION}-linux-${{ matrix.arch }}-gnu"
       - uses: actions/upload-artifact@v7
         with:
           name: native-validation-${{ matrix.target }}
@@ -243,6 +268,8 @@ jobs:
     uses: ./.github/workflows/native-portable.yml
     with:
       windows_simulator: true
+      # Main-branch runs fill the caches PRs read; releases add Windows ARM64.
+      windows_arm64: false
 
   desktop:
     needs: [changes, package, portable]

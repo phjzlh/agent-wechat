@@ -18,13 +18,15 @@ enum PackIntent {
 struct PackJob {
     intent: PackIntent,
     fence: MediaAuthorizationFence,
+    #[serde(with = "super::plan_compaction::plan_bytes::list")]
     reads: Vec<Vec<u8>>,
+    #[serde(default, with = "super::plan_compaction::plan_bytes::option")]
     reply: Option<Vec<u8>>,
     submitted: bool,
     accepted: bool,
     #[serde(default)]
     grant_submitted: bool,
-    #[serde(default)]
+    #[serde(default, with = "super::plan_compaction::plan_bytes::option")]
     grant_reply: Option<Vec<u8>>,
     #[serde(default)]
     grant_accepted: bool,
@@ -362,6 +364,18 @@ impl Core {
                 self.promote_owned_sticker_pack(account, &pack)?;
             }
         }
+        // Completing a sticker receipt can resume replay. Take the replay lock before reacquiring the account lock.
+        let _replay = if matches!(&plan.intent, PackIntent::Sync { controls, .. } if !controls.is_empty())
+        {
+            let runtime = permit.runtime.clone();
+            let replay = permit.transfer(self, account, || {
+                runtime.block_on(self.lock_sync_replay(account))
+            })?;
+            self.resume_media_state(account, id, &plan.fence)?;
+            Some(replay)
+        } else {
+            None
+        };
         let mut row = self.store.media_job(account, id)?;
         row.state = "available".into();
         row.phase = "completed".into();
@@ -376,7 +390,17 @@ impl Core {
         row.data["result"] = json!({"serverAcceptance":status,"profileWriteback":"complete","packCount":self.added_sticker_packs(account)?.items.len()});
         self.store.save_media_job(account, &row)?;
         if let PackIntent::Sync { controls, .. } = &plan.intent {
-            self.finish_sticker_controls(account, controls)?;
+            if !controls.is_empty() {
+                let fence = self.session_fence(account)?;
+                let desired = self.store.runtime(account, "desired")?;
+                self.finish_sticker_controls(
+                    account,
+                    controls,
+                    Some(&mut || {
+                        self.yield_sync_writer(account, permit, &fence, desired.as_deref())
+                    }),
+                )?;
+            }
         }
         Ok(())
     }

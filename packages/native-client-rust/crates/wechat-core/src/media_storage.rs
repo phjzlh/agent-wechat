@@ -8,9 +8,11 @@
 //!
 //! `maintain_media_storage` moves payloads that earlier versions stored inside
 //! `control.sqlite`, deletes uploads no send job needs any more, and removes
-//! files nothing refers to. It never downloads, uploads or resends anything.
+//! files nothing refers to. It rewrites sealed plans that repeat bytes the
+//! account keeps elsewhere (see `media_plan_compaction.rs`) and runs sidecar
+//! retention (see `wechat_store`'s retention module), which reduces finished
+//! records to their receipts. It never downloads, uploads or resends anything.
 use super::*;
-use md5::Md5;
 use std::collections::BTreeSet;
 
 /// A finished send keeps its upload this long, so a client that reuses the
@@ -18,6 +20,8 @@ use std::collections::BTreeSet;
 const UPLOAD_GRACE_SECONDS: i64 = 24 * 60 * 60;
 /// Profile key for media located through its message, not a content hash.
 const BY_MESSAGE: &str = "message";
+/// Upper bound on retention steps in one pass; the next pass continues.
+const RETENTION_STEPS: usize = 10_000;
 
 impl Core {
     /// Read one attachment from the official profile and check it against the
@@ -158,21 +162,37 @@ impl Core {
         asset: &MediaAsset,
         bytes: &[u8],
     ) -> Result<bool> {
+        self.release_to_profile_payload(account, asset, Payload::Bytes(bytes))
+    }
+    /// [`Self::release_to_profile`] for a payload that may be a large file. A
+    /// file or video in the profile is checked in steps, not read whole.
+    pub(super) fn release_to_profile_payload(
+        &self,
+        account: &str,
+        asset: &MediaAsset,
+        payload: Payload<'_>,
+    ) -> Result<bool> {
         if asset.state != "available"
             || asset.official_writeback != "complete"
             || asset.actual_variant != Some(asset.variant)
             || asset.message_id.is_none()
-            || asset.byte_length != Some(bytes.len() as u64)
-            || asset.sha256.as_deref() != Some(digest(bytes).as_str())
+            || asset.byte_length != Some(payload.len())
+            || asset.sha256.as_deref() != Some(payload.sha256().as_str())
         {
             return Ok(false);
         }
         let key = match asset.kind {
-            MediaKind::File | MediaKind::Video => format!("{:x}", Md5::digest(bytes)),
+            MediaKind::File | MediaKind::Video => payload.md5(),
             MediaKind::Image | MediaKind::Voice => BY_MESSAGE.into(),
             MediaKind::Sticker => return Ok(false),
         };
-        if self.profile_media_bytes(account, asset, &key).is_err() {
+        let held = match asset.kind {
+            MediaKind::File | MediaKind::Video => {
+                self.profile_hardlink(account, asset, &key).is_ok()
+            }
+            _ => self.profile_media_bytes(account, asset, &key).is_ok(),
+        };
+        if !held {
             return Ok(false);
         }
         self.authorize_media_record(account, &self.store.media_asset(account, &asset.id)?)?;
@@ -183,6 +203,31 @@ impl Core {
             &key,
         )?;
         Ok(true)
+    }
+    /// Locate a file or video attachment in the official profile and check it
+    /// against the size and hash recorded when it was first verified, reading
+    /// it in steps. A deleted or changed file is an error.
+    pub(super) fn profile_hardlink(
+        &self,
+        account: &str,
+        asset: &MediaAsset,
+        key: &str,
+    ) -> Result<wechat_profile::VerifiedHardlink> {
+        let kind = match asset.kind {
+            MediaKind::File => wechat_profile::HardlinkKind::File,
+            MediaKind::Video => wechat_profile::HardlinkKind::Video,
+            _ => bail!("unsupported_media_variant"),
+        };
+        let verified = self
+            .profile_reader_owned(account)?
+            .verified_hardlink_file(kind, key)
+            .map_err(|_| anyhow::anyhow!("media_not_cached"))?;
+        ensure!(
+            asset.byte_length == Some(verified.byte_length)
+                && asset.sha256.as_deref() == Some(verified.sha256.as_str()),
+            "media_integrity_failed"
+        );
+        Ok(verified)
     }
     /// Decode the still preview of a WXGF image. Previews are made when asked
     /// for and are not stored.
@@ -210,11 +255,56 @@ impl Core {
                 break;
             }
         }
+        // Uploads are released first: retention compacts a send only once its
+        // upload is gone.
         let (previews, uploads, compacted) = self.finish_media_storage(account)?;
+        let plans = self.run_plan_compaction(account)?;
+        let retention = self.run_retention(account)?;
+        let compacted = self.store.compact_control(account).unwrap_or(false) || compacted;
         removed_previews += previews;
         Ok(
-            json!({"sweptFiles":swept,"movedPayloads":moved,"releasedToProfile":released,"removedPreviews":removed_previews,"removedUploads":uploads,"compacted":compacted}),
+            json!({"sweptFiles":swept,"movedPayloads":moved,"releasedToProfile":released,"removedPreviews":removed_previews,"removedUploads":uploads,"compacted":compacted,"compactedPlans":plans,"retention":retention}),
         )
+    }
+    /// Run sidecar retention for one account until no step has work left.
+    fn run_retention(&self, account: &str) -> Result<wechat_store::RetentionStep> {
+        let now = chrono::Utc::now().timestamp();
+        let mut total = wechat_store::RetentionStep::default();
+        let mut after = 0;
+        for _ in 0..RETENTION_STEPS {
+            let step = self.store.retention_step(account, now, after)?;
+            total.add(&step);
+            after = step.runtime_after;
+            if !step.more {
+                break;
+            }
+        }
+        Ok(total)
+    }
+    /// Run retention one small step at a time under the account's mutation
+    /// guard, so other work for the account interleaves, then give freed
+    /// pages back to the file system.
+    async fn guarded_retention(self: &Arc<Self>, account: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let mut after = 0;
+        for _ in 0..RETENTION_STEPS {
+            let Some(step) = self
+                .guarded_storage_step(account, move |core, id| {
+                    core.store.retention_step(id, now, after)
+                })
+                .await
+            else {
+                break;
+            };
+            after = step.runtime_after;
+            if !step.more || self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let _ = self
+            .guarded_storage_step(account, |core, id| core.store.compact_control(id))
+            .await;
     }
     /// Handle up to `limit` payloads that an earlier version stored inside the
     /// database. Returns how many moved to a file, how many were dropped
@@ -298,8 +388,10 @@ impl Core {
                 .and_then(|plain| serde_json::from_slice::<SendPlan>(&plain).ok());
             let Some(plan) = plan else {
                 // Without its plan a job's uploads are unknown. Keep everything
-                // when that job may still need them.
+                // when that job may still need them; a finished one still
+                // releases the upload its record names.
                 if done {
+                    finished.extend(row.data["sourceId"].as_str().map(str::to_owned));
                     continue;
                 }
                 return Ok(None);
@@ -377,9 +469,11 @@ impl Core {
                 let _ = core
                     .guarded_storage_step(&id, |core, id| core.finish_media_storage(id))
                     .await;
+                core.guarded_plan_compaction(&id).await;
+                core.guarded_retention(&id).await;
             }
-            // Release finished uploads and expired preparations every hour, so
-            // large uploads do not wait for the next restart.
+            // Release finished uploads and expired preparations and run
+            // retention every hour, so nothing waits for the next restart.
             let mut hourly = tokio::time::interval(std::time::Duration::from_secs(3600));
             hourly.tick().await;
             loop {
@@ -401,6 +495,8 @@ impl Core {
                             core.release_finished_uploads(id)
                         })
                         .await;
+                    core.guarded_plan_compaction(&account.id).await;
+                    core.guarded_retention(&account.id).await;
                 }
             }
         });
@@ -408,7 +504,7 @@ impl Core {
     }
     /// One blocking storage step under the account's mutation guard. `None`
     /// when the step failed; the next start tries again.
-    async fn guarded_storage_step<T: Send + 'static>(
+    pub(super) async fn guarded_storage_step<T: Send + 'static>(
         self: &Arc<Self>,
         account: &str,
         step: impl FnOnce(&Core, &str) -> Result<T> + Send + 'static,

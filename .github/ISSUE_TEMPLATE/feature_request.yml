@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest something agent-wechat should do.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        agent-wechat follows the official WeChat client. Ideas that go beyond it are welcome, but they need agreement before anyone builds them. If you'd like to build it yourself, describe your approach here and wait for a reply before opening a pull request. 中文也可以。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task, and what stops you today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: official-client
+    attributes:
+      label: Does the official WeChat client do this?
+      description: If it does, say which app (phone or desktop) and how it works there. If it doesn't, or you're not sure, say so.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: How should it work? (optional)
+      description: The command, API or OpenClaw tool you'd use, and how we'd know it works.

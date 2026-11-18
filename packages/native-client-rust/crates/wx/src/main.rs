@@ -1,3 +1,4 @@
+mod contact_requests_cli;
 use anyhow::{bail, Context, Result};
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -13,11 +14,13 @@ use wechat_core::Core;
 mod calls_cli;
 mod cli_help;
 mod client_actions;
+mod config;
 mod daemon;
 mod events;
 mod login;
 mod outcome;
 mod output;
+mod parent_watch;
 mod profile_cli;
 mod profile_export;
 mod settings;
@@ -103,7 +106,11 @@ enum Command {
         command: ConfigCommand,
     },
     /// Run the daemon in the foreground. Use the supplied service unit for background ownership.
-    Serve {},
+    Serve {
+        /// Stop gracefully when the process that started this daemon exits, for an app that owns it.
+        #[arg(long)]
+        exit_with_parent: bool,
+    },
     /// Start, inspect or stop the local background daemon.
     Daemon {
         #[command(subcommand)]
@@ -374,6 +381,52 @@ enum ResourceAction {
 }
 #[derive(Subcommand)]
 enum ContactCommand {
+    /// List saved contacts with optional pagination.
+    List {
+        /// Return at most this many items.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include all cached people, even non-contacts and unknown relationships.
+        #[arg(long)]
+        all: bool,
+        /// Continue from the next-page cursor of the previous result.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+
+    /// Discover a person on WeChat by WeChat ID. Phone lookup is unverified.
+    Search {
+        /// Discovery query, distinct from local contacts find.
+        query: String,
+    },
+    /// Inspect, send, accept or locally delete friend-request conversations.
+    Requests {
+        #[command(subcommand)]
+        command: ContactRequestCommand,
+    },
+    /// Change supplied contact privacy settings; keep omitted settings.
+    #[command(group(clap::ArgGroup::new("privacy_settings").args(["chats_only", "hide_my_posts", "hide_their_posts"]).required(true).multiple(true)))]
+    Set {
+        /// Exact existing contact ID.
+        id: String,
+        #[command(flatten)]
+        privacy: ContactPrivacyOptions,
+        #[command(flatten)]
+        options: MutationOptions,
+    },
+    /// Read an existing contact's relationship privacy.
+    Privacy {
+        #[command(subcommand)]
+        command: ContactPrivacyCommand,
+    },
+    /// Remove this account's contact relationship while preserving chat history.
+    Remove {
+        /// Exact existing ordinary contact ID.
+        id: String,
+        #[command(flatten)]
+        options: MutationOptions,
+    },
+
     #[command(flatten)]
     Catalog(CatalogCommand),
     /// Look up one or two known contact IDs live on WeChat without saving the result.
@@ -381,6 +434,91 @@ enum ContactCommand {
         /// One or two distinct contact IDs to look up live on WeChat.
         #[arg(required = true, num_args = 1..=2)]
         ids: Vec<String>,
+    },
+}
+
+#[derive(Args, Clone, Copy, Default)]
+struct ContactPrivacyOptions {
+    /// Whether to restrict this relationship to chats (true or false).
+    #[arg(long, action = clap::ArgAction::Set)]
+    chats_only: Option<bool>,
+    /// Whether to hide your posts from this contact (true or false).
+    #[arg(long, action = clap::ArgAction::Set)]
+    hide_my_posts: Option<bool>,
+    /// Whether to hide this contact's posts (true or false).
+    #[arg(long, action = clap::ArgAction::Set)]
+    hide_their_posts: Option<bool>,
+}
+
+#[derive(Subcommand)]
+enum ContactPrivacyCommand {
+    /// Read the contact's saved relationship privacy and current version.
+    Get {
+        /// Exact existing contact ID.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContactRequestCommand {
+    /// List saved request conversations in both directions; history is not server pending proof.
+    List {
+        /// Filter by incoming or outgoing direction.
+        #[arg(long,value_parser=["incoming","outgoing"])]
+        direction: Option<String>,
+        /// Show only current incoming acceptance candidates.
+        #[arg(long)]
+        actionable: bool,
+        /// Match saved names, peer identities and verification text.
+        #[arg(long)]
+        search: Option<String>,
+        /// Maximum number of rows on this page, from 1 to 200.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Exact nextCursor from the same query.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Inspect one request, its verification history and current version.
+    Get {
+        /// Exact request ID from list.
+        id: String,
+    },
+    /// Send one friend request using an opaque result from contacts search.
+    /// When any privacy flag is supplied, omitted privacy flags default to false.
+    Send {
+        /// Exact recipientRef from discovery on this account.
+        recipient_ref: String,
+        /// Owner-supplied verification greeting.
+        #[arg(long)]
+        message: String,
+        #[command(flatten)]
+        privacy: ContactPrivacyOptions,
+        #[command(flatten)]
+        options: MutationOptions,
+    },
+    /// Accept the exact inspected version of an incoming request.
+    /// When any privacy flag is supplied, omitted privacy flags default to false.
+    Accept {
+        /// Request ID from list/get.
+        id: String,
+        /// Current version returned by list/get.
+        #[arg(long)]
+        expected_version: String,
+        #[command(flatten)]
+        privacy: ContactPrivacyOptions,
+        #[command(flatten)]
+        options: MutationOptions,
+    },
+    /// Delete local request conversation/history. Does not reject or cancel on WeChat.
+    Delete {
+        /// Request ID from list/get.
+        id: String,
+        /// Current version returned by list/get.
+        #[arg(long)]
+        expected_version: String,
+        #[command(flatten)]
+        options: MutationOptions,
     },
 }
 
@@ -402,15 +540,6 @@ enum CatalogCommand {
         /// Seconds to wait for completion; the work keeps running after the wait ends.
         #[arg(long, default_value_t = 30)]
         wait: u64,
-    },
-    /// List saved entries with optional pagination.
-    List {
-        /// Return at most this many items.
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Continue from the next-page cursor of the previous result.
-        #[arg(long)]
-        cursor: Option<String>,
     },
     /// Show a saved entry by ID.
     Get {
@@ -533,6 +662,16 @@ struct MutationOptions {
 }
 #[derive(Subcommand)]
 enum GroupCommand {
+    /// List saved entries with optional pagination.
+    List {
+        /// Return at most this many items.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Continue from the next-page cursor of the previous result.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+
     #[command(flatten)]
     Catalog(CatalogCommand),
     /// Fetch the member roster for a known group ID live from WeChat without saving it.
@@ -999,6 +1138,8 @@ enum StoreCommand {
         #[arg(long)]
         allow_incomplete: bool,
     },
+    /// Show the selected account's sidecar size, largest record families and the unfinished work retention keeps whole.
+    Usage,
     /// Register a verified key file for the selected account.
     BindKeys {
         /// Private key file for this profile, such as one from wx profiles keys export.
@@ -1175,20 +1316,30 @@ async fn main() {
     }
     std::process::exit(outcome::exit());
 }
-async fn shutdown(core: Arc<Core>) {
+async fn shutdown(core: Arc<Core>, parent: Option<parent_watch::ParentWatch>) {
     async fn requested(core: &Core) {
         while !core.stopping.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    // A parent that exits during startup is noticed once the daemon is ready,
+    // because the watch keeps reporting the exit.
+    async fn orphaned(parent: Option<parent_watch::ParentWatch>) {
+        let Some(parent) = parent else {
+            return std::future::pending().await;
+        };
+        while !parent.exited() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("signal registration");
-        tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=term.recv()=>{}, _=requested(&core)=>{} }
+        tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=term.recv()=>{}, _=requested(&core)=>{}, _=orphaned(parent)=>{} }
     }
     #[cfg(windows)]
-    tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=requested(&core)=>{} }
+    tokio::select! { _=tokio::signal::ctrl_c()=>{}, _=requested(&core)=>{}, _=orphaned(parent)=>{} }
     core.shutdown_gracefully().await;
 }
 
@@ -1199,10 +1350,10 @@ struct Remote {
     account: Option<String>,
 }
 impl Remote {
-    fn new(config: wechat_config::ClientConfig) -> Result<Self> {
+    fn new(config: crate::config::ClientConfig) -> Result<Self> {
         Self::with_token(config, None)
     }
-    fn with_token(config: wechat_config::ClientConfig, token: Option<String>) -> Result<Self> {
+    fn with_token(config: crate::config::ClientConfig, token: Option<String>) -> Result<Self> {
         let base = reqwest::Url::parse(&format!("{}/", config.endpoint.trim_end_matches('/')))?;
         if !base.username().is_empty()
             || base.password().is_some()
@@ -1401,6 +1552,13 @@ fn query(path: String, values: &[(&str, Option<String>)]) -> String {
     )
 }
 async fn run(cli: Cli) -> Result<()> {
+    // Record the parent first, while the process that started serve is still running.
+    let parent = match &cli.command {
+        Command::Serve {
+            exit_with_parent: true,
+        } => Some(parent_watch::ParentWatch::new().context("cannot watch the parent process")?),
+        _ => None,
+    };
     let output = Output::new(cli.json);
     if matches!(
         &cli.command,
@@ -1457,7 +1615,7 @@ async fn run(cli: Cli) -> Result<()> {
     {
         bail!("--token-stdin is supported by serve and HTTP client commands");
     }
-    let env = wechat_config::Environment::capture();
+    let env = crate::config::Environment::capture();
     let cwd = std::env::current_dir()?;
     if matches!(
         &cli.command,
@@ -1468,8 +1626,8 @@ async fn run(cli: Cli) -> Result<()> {
                 command: ConfigCommand::Show
             }
     ) {
-        let config = wechat_config::resolve(
-            &wechat_config::Overrides {
+        let config = crate::config::resolve(
+            &crate::config::Overrides {
                 server_config: cli.server_config.clone(),
                 data_dir: cli.data_dir.clone(),
                 token_file: cli.token_file.clone(),
@@ -1482,7 +1640,7 @@ async fn run(cli: Cli) -> Result<()> {
             &cwd,
         )?;
         return match cli.command {
-            Command::Serve {} => serve(config, cli.token_stdin, cli.json).await,
+            Command::Serve { .. } => serve(config, cli.token_stdin, cli.json, parent).await,
             Command::Daemon { command } => daemon::run(config, command, output).await,
             Command::Store { command } => {
                 offline(config, cli.account.unwrap_or_default(), command, output)
@@ -1600,8 +1758,8 @@ async fn run(cli: Cli) -> Result<()> {
             output,
         );
     }
-    let config = wechat_config::resolve(
-        &wechat_config::Overrides {
+    let config = crate::config::resolve(
+        &crate::config::Overrides {
             server_config: cli.server_config.clone(),
             data_dir: cli.data_dir.clone(),
             token_file: cli.token_file.clone(),
@@ -1742,6 +1900,44 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Calls { command } => {
             return calls_cli::run(&r, command.context("choose a calls command")?, cli.json).await;
         }
+        Command::Contacts {
+            command: Some(ContactCommand::Search { query }),
+            ..
+        } => {
+            r.post(&r.path("search/contacts")?, json!({"query":query}))
+                .await?
+        }
+        Command::Contacts {
+            command: Some(ContactCommand::Requests { command }),
+            ..
+        } => contact_requests_cli::requests(&r, &settings, command).await?,
+        Command::Contacts {
+            command: Some(ContactCommand::Privacy { command }),
+            ..
+        } => contact_requests_cli::privacy(&r, &settings, command).await?,
+        Command::Contacts {
+            command:
+                Some(ContactCommand::Set {
+                    id,
+                    privacy,
+                    options,
+                }),
+            ..
+        } => contact_requests_cli::set_contact(&r, &settings, id, privacy, options).await?,
+        Command::Contacts {
+            command: Some(ContactCommand::Remove { id, options }),
+            ..
+        } => {
+            client_actions::mutation(
+                &r,
+                &settings,
+                Method::DELETE,
+                &format!("contacts/{}", encode(&id)),
+                json!({}),
+                options,
+            )
+            .await?
+        }
         Command::LookupContacts { ids }
         | Command::Contacts {
             command: Some(ContactCommand::Lookup { ids }),
@@ -1841,6 +2037,13 @@ async fn run(cli: Cli) -> Result<()> {
                 &[("cursor", cursor), ("limit", limit.map(|v| v.to_string()))],
             ))
             .await?
+        }
+        Command::Contacts {
+            command: Some(ContactCommand::List { limit, cursor, all }),
+            ..
+        } => {
+            client_actions::catalog_list(&r, "contacts", limit, cursor, all.then_some("all"))
+                .await?
         }
         Command::Contacts {
             command: Some(ContactCommand::Catalog(command)),
@@ -2274,7 +2477,12 @@ async fn stdin_token() -> Result<String> {
     }
     Ok(token.into())
 }
-async fn serve(config: wechat_config::ServerConfig, token_stdin: bool, json: bool) -> Result<()> {
+async fn serve(
+    config: crate::config::ServerConfig,
+    token_stdin: bool,
+    json: bool,
+    parent: Option<parent_watch::ParentWatch>,
+) -> Result<()> {
     let supplied = if token_stdin {
         if config.token_explicit {
             bail!("--token-stdin cannot be combined with a configured tokenFile");
@@ -2314,8 +2522,8 @@ async fn serve(config: wechat_config::ServerConfig, token_stdin: bool, json: boo
         eprintln!("Daemon ready on {listen} (server ID {}).", store.server_id);
     }
     let router = wechat_api::router(core.clone(), &token);
-    let local =
-        axum::serve(listener, router.clone()).with_graceful_shutdown(shutdown(core.clone()));
+    let local = axum::serve(listener, router.clone())
+        .with_graceful_shutdown(shutdown(core.clone(), parent));
     if let Some((socket, tls)) = network {
         let handle = axum_server::Handle::new();
         let stop_handle = handle.clone();
@@ -2397,7 +2605,7 @@ async fn wait_operation_checked(
 }
 
 fn offline(
-    config: wechat_config::ServerConfig,
+    config: crate::config::ServerConfig,
     account: String,
     command: StoreCommand,
     output: Output,
@@ -2449,6 +2657,7 @@ fn offline(
             let manifest = store.export(&account, &destination, source_stopped)?;
             output.print(&projection.receipt(manifest.entries.len())?)
         }
+        StoreCommand::Usage => output.print(&store.storage_usage(&account)?),
         StoreCommand::BindKeys { keys_file } => {
             wechat_profile::KeyFile::load(&keys_file)?;
             store.set_keys_file(&account, &keys_file)?;

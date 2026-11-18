@@ -33,7 +33,7 @@ https://github.com/user-attachments/assets/764bc53f-cea2-4b3e-99a1-34fdcb43ec09
 2. 选择 **使用此设备** 以运行本地 Hub，或选择 **连接到其他 Hub**。
 3. 添加微信 Profile，并按照手机上的提示完成登录。
 
-应用内置聊天界面、原生 Hub 以及 `wx` CLI。安装包、系统要求、连接密钥和网络配置，请参阅[桌面端指南](https://thisnick.github.io/agent-wechat/zh-cn/setup/desktop/)。各平台的桌面端打包与安装后的验收情况有所不同；请根据你所用的版本，查看[平台验收状态](PLATFORM-ACCEPTANCE.md)和发布说明。
+应用内置聊天界面、原生 Hub 以及 `wx` CLI。安装包、系统要求、连接密钥和网络配置，请参阅[桌面端指南](https://thisnick.github.io/agent-wechat/zh-cn/setup/desktop/)。各平台的桌面端打包与安装后的验收情况有所不同；请根据你所用的版本，查看[平台验收状态](RELEASING.md#platform-release-candidate-acceptance)和发布说明。
 
 ### 终端与 API
 
@@ -81,6 +81,7 @@ wx messages media CHAT_ID MESSAGE_ID --output ./saved-image.jpg
 | 微信视频号 | 接收视频号卡片，查看封面、发布者、描述和时长，并下载视频号视频。 |
 | 表情 | 接收表情，包括动态原图。将图片、GIF 和 MOV/MP4 片段保存为自定义表情；调整“我的表情”的顺序或移除其中的表情；浏览并添加符合条件的免费官方表情包，并将表情包导出为 GIF；从“我的表情”或已添加的表情包中发送表情。发送使用 GIF 原图；不支持付费表情包。 |
 | @ 提醒 | 发送真实的群成员 @ 提醒，或在允许的情况下 @所有人；解析收到消息中的 @ 提醒元数据。 |
+| 好友管理 | 通过微信号查找用户、发送和通过好友申请，以及删除联系人并保留聊天记录。可为每位好友设置「仅聊天」「不让对方看我的朋友圈」和「不看对方的朋友圈」。 |
 | 联系人与群聊 | 查找联系人和群聊，搜索群成员，读取群成员列表和头像，并刷新已保存的元数据。 |
 | 群管理 | 在账号权限允许的范围内，创建、重命名和退出群聊，添加或移除成员，设置你在群内的昵称，清空群公告，以及设置消息免打扰。部分资料更新仍为局部更新。 |
 | 会话管理 | 置顶或取消置顶受支持的会话；开启或关闭普通联系人和群聊的消息免打扰。 |
@@ -88,7 +89,7 @@ wx messages media CHAT_ID MESSAGE_ID --output ./saved-image.jpg
 | 桌面端 | 会话搜索与会话分类、媒体查看、引用消息跳转、@ 选择器、表情选择器、系统原生文件保存、托盘行为和系统通知，界面支持英文和简体中文。平台验收状态见上文。 |
 | 自动化 | 使用 `wx` CLI 或经身份验证的 HTTP API；跟随可重放的事件流，并查看发送和下载任务。 |
 
-媒体的可用性取决于接收来源、支持的格式和大小限制。搜索仅覆盖已保存的历史记录，不包含远端的全部历史。详见[消息类型](https://thisnick.github.io/agent-wechat/zh-cn/how-it-works/message-types/)、[媒体](https://thisnick.github.io/agent-wechat/zh-cn/use/media/)、[表情](https://thisnick.github.io/agent-wechat/zh-cn/use/stickers/)和[群聊](https://thisnick.github.io/agent-wechat/zh-cn/use/groups/)。
+媒体的可用性取决于接收来源、支持的格式和大小限制。搜索仅覆盖已保存的历史记录，不包含远端的全部历史。详见[消息类型](https://thisnick.github.io/agent-wechat/zh-cn/how-it-works/message-types/)、[媒体](https://thisnick.github.io/agent-wechat/zh-cn/use/media/)、[表情](https://thisnick.github.io/agent-wechat/zh-cn/use/stickers/)、[群聊](https://thisnick.github.io/agent-wechat/zh-cn/use/groups/)和[联系人与隐私](https://thisnick.github.io/agent-wechat/zh-cn/use/contacts/)。
 
 ## 使用现有的官方 Profile
 
@@ -97,13 +98,13 @@ Agent WeChat 可以**直接**读取现有的 Linux 版微信官方 Profile（无
 | Profile 数据 | 读取 | 写入 |
 | --- | --- | --- |
 | 消息 | 已保存的历史记录及受支持的富文本内容 | 新收到的消息和已被接受的外发消息；受支持的撤回更新 |
-| 联系人 | 已保存的联系人元数据和头像 | 通过微信同步接收的受支持元数据 |
+| 联系人 | 已保存的联系人、头像、好友申请记录和隐私设置 | 受支持的同步更新、好友申请记录、联系人删除和隐私设置变更 |
 | 群聊 | 群详情、成员列表、群名称和消息免打扰设置 | 受支持的同步字段和群操作结果；部分更新仍为局部更新 |
 | 媒体 | 受支持的已缓存图片、视频、文件和语音消息 | 受支持的已下载或已发送缓存文件，以及对应的资源记录 |
 | 会话状态 | 会话列表、未读状态、受支持的置顶和免打扰设置 | 受支持的已读状态、置顶和消息提醒更新 |
 | 登录信息 | 受支持的已保存账号和设备信息（在微信接受的情况下） | 受支持的、已被接受的登录与路由信息更新 |
 
-离线 Profile 命令可以在不启动 Daemon、不连接网络的情况下，借助保留源文件的快照和所需密钥，检视受支持的历史记录、联系人、群聊和媒体。这里的联系人写入仅指同步的元数据，并不代表支持任意添加、删除或编辑好友。
+离线 Profile 命令可以在不启动 Daemon、不连接网络的情况下，借助保留源文件的快照和所需密钥，检视受支持的历史记录、联系人、群聊和媒体。
 
 现有 Profile 的兼容性面向已识别的 Linux 版微信数据布局。未识别的文件会被保留，不受支持的数据库结构会被拒绝。官方搜索索引的通用维护、任意 Profile 迁移以及无缝切换回官方应用，目前尚未得到验证。复制、导入和导出流程仍属实验性功能。详见[原生 Profile 指南](packages/native-client-rust/README.md)。
 
@@ -167,8 +168,8 @@ pnpm client:dev
 
 前置条件与场景控制，请参阅[客户端预览指南](packages/client-ui/README.md)和[模拟器指南](packages/native-client-rust/crates/wechat-simulator/README.md)。如需构建并测试改动，请先阅读 [AGENTS.md](AGENTS.md) 和[构建指南](https://thisnick.github.io/agent-wechat/zh-cn/reference/build/)。
 
-[演示素材与画廊源码](scripts/demo-gallery/README.md)包含成片视频、截图、合成的视觉测试素材和图片生成脚本。[视频剪辑源码](scripts/demo-video/README.md)保留了动态标题、时间轴和原创配乐；私有的原始录屏不纳入 Git 仓库。
+[演示素材与画廊源码](docs/demo/gallery/README.md)包含成片视频、截图、合成的视觉测试素材和图片生成脚本。[视频剪辑源码](docs/demo/video/README.md)保留了动态标题、时间轴和原创配乐；私有的原始录屏不纳入 Git 仓库。
 
 ## 许可证
 
-Agent WeChat 的原创项目代码采用 [MIT 许可证](LICENSE)。第三方组件保留其原有的许可证和声明；请查阅[随附声明](packages/cli/THIRD_PARTY_NOTICES.txt)、各组件的独立声明，以及 [Inter 字体许可证](scripts/demo-video/fonts/OFL.txt)。
+Agent WeChat 的原创项目代码采用 [MIT 许可证](LICENSE)。第三方组件保留其原有的许可证和声明；请查阅[随附声明](packages/cli/THIRD_PARTY_NOTICES.txt)、各组件的独立声明，以及 [Inter 字体许可证](docs/demo/video/fonts/OFL.txt)。

@@ -14,7 +14,7 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     Ok(())
 }
 /// The account `control.sqlite` schema version after every migration.
-pub(crate) const ACCOUNT_SCHEMA_VERSION: i64 = 13;
+pub(crate) const ACCOUNT_SCHEMA_VERSION: i64 = 15;
 pub fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -332,11 +332,23 @@ impl Store {
             tx.execute_batch(include_str!("../migrations/account/V013__media_files.sql"))?;
             tx.commit()?;
         }
+        if version < 14 {
+            let tx = db.transaction()?;
+            tx.execute_batch(include_str!(
+                "../migrations/account/V014__contact_mutations.sql"
+            ))?;
+            tx.commit()?;
+        }
+        if version < 15 {
+            let tx = db.transaction()?;
+            tx.execute_batch(include_str!("../migrations/account/V015__retired_keys.sql"))?;
+            tx.commit()?;
+        }
         Ok(())
     }
     pub fn protected_state_exists(&self) -> Result<bool> {
         for account in self.accounts()? {
-            if self.control(&account.id,|db|Ok(db.query_row("SELECT (SELECT count(*) FROM runtime)+(SELECT count(*) FROM outbox)+(SELECT count(*) FROM apply_intents)+(SELECT count(*) FROM media_sources)+(SELECT count(*) FROM media_jobs)+(SELECT count(*) FROM media_assets)+(SELECT count(*) FROM pagination_views)+(SELECT count(*) FROM message_recalls)+(SELECT count(*) FROM outgoing_recalls)+(SELECT count(*) FROM group_mutations)+(SELECT count(*) FROM call_sessions)+(SELECT count(*) FROM call_actions)",[],|r|r.get::<_,i64>(0))?>0))? {return Ok(true);}
+            if self.control(&account.id,|db|Ok(db.query_row("SELECT (SELECT count(*) FROM runtime WHERE key NOT GLOB 'retention-day:*')+(SELECT count(*) FROM outbox)+(SELECT count(*) FROM apply_intents)+(SELECT count(*) FROM media_sources)+(SELECT count(*) FROM media_jobs)+(SELECT count(*) FROM media_assets)+(SELECT count(*) FROM pagination_views)+(SELECT count(*) FROM message_recalls)+(SELECT count(*) FROM outgoing_recalls)+(SELECT count(*) FROM group_mutations)+(SELECT count(*) FROM contact_mutations)+(SELECT count(*) FROM call_sessions)+(SELECT count(*) FROM call_actions)",[],|r|r.get::<_,i64>(0))?>0))? {return Ok(true);}
         }
         Ok(false)
     }
@@ -409,10 +421,7 @@ impl Store {
                 "INSERT INTO events VALUES(?1,?2,?3,?4)",
                 params![seq, kind, serde_json::to_string(data)?, now],
             )?;
-            tx.execute(
-                "DELETE FROM events WHERE sequence < ?1",
-                [seq.saturating_sub(10_000)],
-            )?;
+            crate::trim_events(&tx)?;
             tx.commit()?;
             Ok(Event {
                 cursor: seq.to_string(),
@@ -446,14 +455,15 @@ impl Store {
             let changed=tx.execute("INSERT INTO operations VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET state=excluded.state,result_json=excluded.result_json,updated_at=excluded.updated_at WHERE operations.state NOT IN ('cancelled','succeeded','failed','expired','rejected','needs_login','needs_review') OR operations.state=excluded.state",params![op.id,op.kind,op.state,serde_json::to_string(&op.result)?,op.created_at,op.updated_at])?;
             if changed==1 {
                 tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('operation.updated',?1,?2)",params![serde_json::to_string(&serde_json::json!({"id":op.id,"state":op.state,"kind":op.kind}))?,op.updated_at])?;
-                let seq=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
+                crate::trim_events(&tx)?;
             }
             tx.commit()?;Ok(())
         })
     }
     pub fn operation(&self, account: &str, id: &str) -> Result<Operation> {
         self.control(account,|db|{
-        let (kind,state,result,created,updated):(String,String,String,String,String)=db.query_row("SELECT kind,state,result_json,created_at,updated_at FROM operations WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+        let row=db.query_row("SELECT kind,state,result_json,created_at,updated_at FROM operations WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).map_err(anyhow::Error::from);
+        let (kind,state,result,created,updated)=crate::retention::expired_if_missing(db,crate::retention::OPERATION_ID,id,row)?;
         Ok(Operation {id:id.into(),account_id:account.into(),kind,state,result:serde_json::from_str(&result)?,created_at:created,updated_at:updated})
     })
     }
@@ -518,6 +528,12 @@ impl Store {
                 let intent = read_send(&tx, account, &id)?;
                 return Ok((intent, false));
             }
+            crate::retention::ensure_key_live(&tx, crate::retention::SEND_KEY, key)?;
+            crate::retention::ensure_key_live(
+                &tx,
+                crate::retention::MEDIA_KEY,
+                &format!("send:{key}"),
+            )?;
             let id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             tx.execute(
@@ -532,17 +548,20 @@ impl Store {
                     chrono::Utc::now().to_rfc3339()
                 ],
             )?;
-            let seq = tx.last_insert_rowid();
-            tx.execute(
-                "DELETE FROM events WHERE sequence<=?1",
-                [seq.saturating_sub(10_000)],
-            )?;
+            crate::trim_events(&tx)?;
             tx.commit()?;
             Ok((intent, true))
         })
     }
     pub fn send(&self, account: &str, id: &str) -> Result<SendIntent> {
-        self.control(account, |db| read_send(db, account, id))
+        self.control(account, |db| {
+            crate::retention::expired_if_missing(
+                db,
+                crate::retention::SEND_ID,
+                id,
+                read_send(db, account, id),
+            )
+        })
     }
     pub fn queued_sends(&self, account: &str) -> Result<Vec<String>> {
         self.control(account, |db| {
@@ -571,7 +590,7 @@ impl Store {
             tx.execute("UPDATE outbox SET state=?2,server_id=COALESCE(?3,server_id),error_code=?4 WHERE id=?1 AND state!='cancelled'",params![id,state,server_id,error])?;
             let intent=read_send(&tx,account,id)?;
             tx.execute("INSERT INTO events(kind,data_json,created_at)VALUES('send.updated',?1,?2)",params![serde_json::to_string(&intent)?,chrono::Utc::now().to_rfc3339()])?;
-            let seq=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence<=?1",[seq.saturating_sub(10_000)])?;
+            crate::trim_events(&tx)?;
             tx.commit()?;Ok(intent)
         })
     }
@@ -744,10 +763,7 @@ impl Store {
                 "INSERT INTO runtime VALUES(?1,?2)",
                 params![receipt, seq.to_string().as_bytes()],
             )?;
-            tx.execute(
-                "DELETE FROM events WHERE sequence < ?1",
-                [seq.saturating_sub(10_000)],
-            )?;
+            crate::trim_events(&tx)?;
             tx.commit()?;
             Ok(Some(Event {
                 cursor: seq.to_string(),
@@ -1258,7 +1274,7 @@ mod runtime_prefix_tests {
             .stage_sync("test", "old", b"old sealed commands", b"message cursor")
             .unwrap();
         store.control("test", |db| {
-            db.execute_batch("ALTER TABLE media_assets DROP COLUMN payload_file;ALTER TABLE media_assets DROP COLUMN profile_key;ALTER TABLE media_sources DROP COLUMN payload_file;DROP TABLE call_actions;DROP TABLE call_sessions;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;PRAGMA user_version=7;")?;
+            db.execute_batch("ALTER TABLE media_assets DROP COLUMN payload_file;ALTER TABLE media_assets DROP COLUMN profile_key;ALTER TABLE media_sources DROP COLUMN payload_file;DROP TABLE call_actions;DROP TABLE call_sessions;DROP INDEX apply_intents_stream;ALTER TABLE apply_intents DROP COLUMN stream;DROP TABLE contact_mutations;DROP TABLE retired_keys;PRAGMA user_version=7;")?;
             Ok(())
         }).unwrap();
         drop(store);

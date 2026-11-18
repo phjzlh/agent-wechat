@@ -35,6 +35,16 @@ impl Store {
             Ok(())
         })
     }
+    /// Queued exact contact lookups for versioned personal remarks, oldest first.
+    pub fn contact_remark_refreshes(&self, account: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.control(account, |db| {
+            let mut q = db.prepare(
+                "SELECT key,value FROM runtime WHERE key GLOB 'contact-remark-refresh:*' ORDER BY rowid LIMIT 8",
+            )?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
     pub fn pending_metadata(&self, account: &str) -> Result<Vec<(String, Vec<u8>)>> {
         self.control(account,|db|{let mut q=db.prepare("SELECT substr(p.key,18),r.value FROM runtime p JOIN runtime r ON r.key='metadata-receipt:'||substr(p.key,18) WHERE p.key LIKE 'metadata-pending:%' ORDER BY p.key LIMIT 1000")?;let rows=q.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?;Ok(rows.collect::<rusqlite::Result<_>>()?)})
     }
@@ -46,7 +56,7 @@ impl Store {
         summary: &serde_json::Value,
     ) -> Result<()> {
         self.control(account,|db|{let tx=db.transaction()?;let pending=format!("metadata-pending:{id}");let n=tx.execute("DELETE FROM runtime WHERE key=?1",[&pending])?;if n==0{return Ok(())};if let Some((key,sealed))=cursor{if !matches!(key,"metadata-contacts-cursor"|"metadata-groups-cursor"){bail!("invalid metadata cursor key")};tx.execute("INSERT INTO runtime VALUES(?1,?2)ON CONFLICT(key)DO UPDATE SET value=excluded.value",params![key,sealed])?;}
-   let seq:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events",[],|r|r.get(0))?;tx.execute("INSERT INTO events VALUES(?1,'metadata.changed',?2,?3)",params![seq,serde_json::to_string(summary)?,chrono::Utc::now().to_rfc3339()])?;tx.execute("DELETE FROM events WHERE sequence < ?1",[seq.saturating_sub(10_000)])?;tx.commit()?;Ok(())})
+   let seq:i64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events",[],|r|r.get(0))?;tx.execute("INSERT INTO events VALUES(?1,'metadata.changed',?2,?3)",params![seq,serde_json::to_string(summary)?,chrono::Utc::now().to_rfc3339()])?;crate::trim_events(&tx)?;tx.commit()?;Ok(())})
     }
 }
 
@@ -58,7 +68,8 @@ impl Store {
             let tx = db.transaction()?;
             let old: Option<Vec<u8>> = tx.query_row("SELECT payload FROM apply_intents WHERE id=?1", [id], |r| r.get(0)).optional()?;
             if let Some(old) = old {
-                if old != payload { bail!("sticker_projection_conflict"); }
+                // Retention empties the payload of a batch already applied.
+                if !old.is_empty() && old != payload { bail!("sticker_projection_conflict"); }
                 return Ok(());
             }
             tx.execute("INSERT INTO apply_intents(id,payload,state,created_at,stream) VALUES(?1,?2,'pending',?3,'stickers')", params![id,payload,chrono::Utc::now().to_rfc3339()])?;
@@ -83,8 +94,7 @@ impl Store {
             let changed = tx.execute("UPDATE apply_intents SET state='projected' WHERE id=?1 AND stream='stickers' AND state!='projected'", [id])?;
             if changed != 0 {
                 tx.execute("INSERT INTO events(kind,data_json,created_at) VALUES('sticker-collections.changed',?1,?2)", params![serde_json::json!({"collectionId":"saved","revision":revision}).to_string(),chrono::Utc::now().to_rfc3339()])?;
-                let sequence = tx.last_insert_rowid();
-                tx.execute("DELETE FROM events WHERE sequence < ?1", [sequence.saturating_sub(10_000)])?;
+                crate::trim_events(&tx)?;
             }
             tx.commit()?;
             Ok(())
@@ -104,7 +114,7 @@ impl Store {
         self.control(account,|db| {
             let tx=db.transaction()?;
             let old: Option<Vec<u8>>=tx.query_row("SELECT payload FROM apply_intents WHERE id=?1",[id],|r|r.get(0)).optional()?;
-            if let Some(old)=old {if old!=payload {bail!("sticker_projection_conflict");}return Ok(());}
+            if let Some(old)=old {if !old.is_empty() && old!=payload {bail!("sticker_projection_conflict");}return Ok(());}
             tx.execute("INSERT INTO apply_intents(id,payload,state,created_at,stream) VALUES(?1,?2,'pending',?3,'sticker_packs')",params![id,payload,chrono::Utc::now().to_rfc3339()])?;
             tx.execute("INSERT INTO runtime VALUES('sticker-pack-projection-latest',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[id.as_bytes()])?;
             tx.commit()?;Ok(())
@@ -131,7 +141,7 @@ impl Store {
             let tx=db.transaction()?;
             if tx.execute("UPDATE apply_intents SET state='projected' WHERE id=?1 AND stream='sticker_packs' AND state!='projected'",[id])? != 0 {
                 tx.execute("INSERT INTO events(kind,data_json,created_at) VALUES('sticker-collections.changed',?1,?2)",params![serde_json::json!({"collectionId":"packs","revision":revision}).to_string(),chrono::Utc::now().to_rfc3339()])?;
-                let sequence=tx.last_insert_rowid();tx.execute("DELETE FROM events WHERE sequence < ?1",[sequence.saturating_sub(10000)])?;
+                crate::trim_events(&tx)?;
             }tx.commit()?;Ok(())
         })
     }

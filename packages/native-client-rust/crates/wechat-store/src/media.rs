@@ -54,6 +54,13 @@ pub struct MediaAssetRecord {
     /// Present on writes and `media_asset_with_payload`; metadata reads omit it.
     pub payload: Option<Vec<u8>>,
 }
+/// An asset's own sealed copy, opened for streaming reads.
+pub enum MediaAssetPayload {
+    /// A private payload file; `name` is the file name its row records.
+    File { file: std::fs::File, name: String },
+    /// A sealed payload an earlier version stored inside the database.
+    Embedded(Vec<u8>),
+}
 pub struct CompletedUploadRetry<'a> {
     pub expected: &'a MediaJobRecord,
     pub source: &'a OwnedMediaSource,
@@ -80,7 +87,7 @@ pub(crate) fn read_job(db: &Connection, id: &str) -> Result<MediaJobRecord> {
         updated_at: row.11,
     })
 }
-fn read_asset(db: &Connection, id: &str) -> Result<MediaAssetRecord> {
+pub(crate) fn read_asset(db: &Connection, id: &str) -> Result<MediaAssetRecord> {
     // Metadata and authorization checks must not materialize attachment BLOBs.
     let row = db.query_row(
         "SELECT id,message_id,variant,kind,metadata_json,plan FROM media_assets WHERE id=?1",
@@ -106,7 +113,13 @@ fn read_asset(db: &Connection, id: &str) -> Result<MediaAssetRecord> {
         payload: None,
     })
 }
-fn media_event(tx: &Connection, kind: &str, data: &Value) -> Result<()> {
+fn media_event(tx: &Connection, kind: &str, data: &Value) -> Result<i64> {
+    let seq = insert_event(tx, kind, data)?;
+    crate::trim_events(tx)?;
+    Ok(seq)
+}
+/// Append one event without trimming the log; returns its sequence number.
+fn insert_event(tx: &Connection, kind: &str, data: &Value) -> Result<i64> {
     let seq: i64 = tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events", [], |r| {
         r.get(0)
     })?;
@@ -119,9 +132,59 @@ fn media_event(tx: &Connection, kind: &str, data: &Value) -> Result<()> {
             chrono::Utc::now().to_rfc3339()
         ],
     )?;
+    Ok(seq)
+}
+/// Fields of a `job.updated` event that only report transfer progress.
+const PROGRESS_FIELDS: [&str; 3] = ["completedBytes", "totalBytes", "updatedAt"];
+/// Record a `job.updated` event. When the job's previous one differs only in
+/// [`PROGRESS_FIELDS`], it is deleted after the new one is inserted, so the
+/// event log keeps one progress event per job state instead of one per
+/// chunk. Sequence numbers are never reused, state changes are never
+/// merged, and the oldest event is never deleted (that would make a cursor
+/// just before it look expired).
+fn job_updated_event(tx: &Connection, job: &str, data: &Value) -> Result<()> {
+    let key = format!("job-event:{job}");
+    let previous: Option<i64> = tx
+        .query_row(
+            "SELECT CAST(CAST(value AS TEXT) AS INTEGER) FROM runtime WHERE key=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let seq = insert_event(tx, "job.updated", data)?;
+    if let Some(previous) = previous {
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind,data_json FROM events WHERE sequence=?1 AND sequence>(SELECT MIN(sequence) FROM events)",
+                [previous],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let progress_only = |old: &Value| {
+            let strip = |value: &Value| {
+                let mut value = value.clone();
+                if let Some(object) = value.as_object_mut() {
+                    for field in PROGRESS_FIELDS {
+                        object.remove(field);
+                    }
+                }
+                value
+            };
+            strip(old) == strip(data)
+        };
+        if let Some((kind, raw)) = row {
+            if kind == "job.updated"
+                && serde_json::from_str::<Value>(&raw).is_ok_and(|old| progress_only(&old))
+            {
+                tx.execute("DELETE FROM events WHERE sequence=?1", [previous])?;
+            }
+        }
+    }
+    // Trim after the merge, so the log still holds its full row count.
+    crate::trim_events(tx)?;
     tx.execute(
-        "DELETE FROM events WHERE sequence < ?1",
-        [seq.saturating_sub(10_000)],
+        "INSERT INTO runtime(key,value)VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, seq.to_string().into_bytes()],
     )?;
     Ok(())
 }
@@ -134,7 +197,17 @@ fn job_changed(old: &MediaJobRecord, new: &MediaJobRecord) -> bool {
         || old.error_code != new.error_code
         || old.data != new.data
 }
-fn job_event(tx: &Connection, account: &str, row: &MediaJobRecord) -> Result<()> {
+/// Copy a WAL sidecar's log back into the database and truncate it, so a
+/// rewrite does not leave a log as large as the database. An open read
+/// snapshot can keep the log in use; the next pass tries again.
+fn checkpoint(db: &Connection) -> Result<()> {
+    let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    }
+    Ok(())
+}
+pub(crate) fn job_event(tx: &Connection, account: &str, row: &MediaJobRecord) -> Result<()> {
     if let Some(id) = row.data["assetId"].as_str() {
         let metadata: Option<String> = tx
             .query_row(
@@ -167,7 +240,7 @@ fn job_event(tx: &Connection, account: &str, row: &MediaJobRecord) -> Result<()>
         }
     }
     let data = json!({"id":row.id,"jobId":row.id,"accountId":account,"kind":row.kind,"state":row.state,"phase":row.phase,"attempts":row.attempts,"cancelRequested":row.cancel_requested,"retryable":row.retryable,"reason":row.error_code,"assetId":row.data["assetId"],"sourceId":row.data["sourceId"],"threadId":row.data["threadId"],"serverMessageId":row.data["serverMessageId"],"completedBytes":row.data["completedBytes"],"totalBytes":row.data["totalBytes"],"result":row.data["result"],"createdAt":row.created_at,"updatedAt":row.updated_at});
-    media_event(tx, "job.updated", &data)?;
+    job_updated_event(tx, &row.id, &data)?;
     if row.kind == "send"
         && matches!(
             row.state.as_str(),
@@ -430,6 +503,10 @@ impl Store {
                 if old!=hash { bail!("idempotency_conflict"); }
                 return Ok((read_job(&tx,&id)?,false));
             }
+            crate::retention::ensure_key_live(&tx, crate::retention::MEDIA_KEY, key)?;
+            if let Some(send) = key.strip_prefix("send:") {
+                crate::retention::ensure_key_live(&tx, crate::retention::SEND_KEY, send)?;
+            }
             let queued:u32=tx.query_row("SELECT count(*) FROM media_jobs WHERE state IN ('queued','running')",[],|r|r.get(0))?;
             if queued>=100 { bail!("media_queue_full"); }
             let now=chrono::Utc::now().to_rfc3339();
@@ -445,21 +522,36 @@ impl Store {
     /// temporary archives after membership changes. This is not a pack catalog.
     pub fn completed_sticker_acquisitions(&self, account: &str, pack: &str) -> Result<Vec<String>> {
         self.control(account,|db| {
-            let mut query=db.prepare("SELECT id FROM media_jobs WHERE kind='sticker_acquire' AND state='available' AND json_extract(data_json,'$.packId')=?1 ORDER BY updated_at DESC LIMIT 5")?;
-            let rows=query.query_map([pack],|row|row.get(0))?;
+            // Retention keeps these plans and empties older ones: see
+            // `retention::reused_acquisition_ids`.
+            let mut query=db.prepare("SELECT id FROM media_jobs WHERE kind='sticker_acquire' AND state='available' AND json_extract(data_json,'$.packId')=?1 ORDER BY updated_at DESC,id DESC LIMIT ?2")?;
+            let rows=query.query_map(params![pack,crate::retention::REUSED_ACQUISITIONS],|row|row.get(0))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
     pub fn media_job(&self, account: &str, id: &str) -> Result<MediaJobRecord> {
-        self.control(account, |db| read_job(db, id))
+        self.control(account, |db| {
+            crate::retention::expired_if_missing(
+                db,
+                crate::retention::MEDIA_ID,
+                id,
+                read_job(db, id),
+            )
+        })
     }
     pub fn media_job_by_key(&self, account: &str, key: &str) -> Result<MediaJobRecord> {
         self.control(account, |db| {
-            let id: String = db.query_row(
-                "SELECT id FROM media_jobs WHERE idempotency_key=?1",
-                [key],
-                |r| r.get(0),
-            )?;
+            let id: Option<String> = db
+                .query_row(
+                    "SELECT id FROM media_jobs WHERE idempotency_key=?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                crate::retention::ensure_key_live(db, crate::retention::MEDIA_KEY, key)?;
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            };
             read_job(db, &id)
         })
     }
@@ -479,6 +571,9 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
+            if existing.is_none() {
+                crate::retention::ensure_key_live(db, crate::retention::MEDIA_KEY, key)?;
+            }
             existing
                 .map(|(id, old)| {
                     if old != hash {
@@ -491,7 +586,7 @@ impl Store {
     }
     pub fn pending_media_projections(&self, account: &str) -> Result<Vec<String>> {
         self.control(account,|db|{
-            let mut query=db.prepare("SELECT id FROM media_jobs WHERE kind='send' AND state IN ('accepted','failed','cancelled','needs_review') AND coalesce(json_extract(data_json,'$.result.profileProjection'),'') NOT IN ('complete','not_applicable','unknown') ORDER BY created_at,id LIMIT 100")?;
+            let mut query=db.prepare("SELECT id FROM media_jobs WHERE kind='send' AND state IN ('accepted','failed','cancelled','needs_review') AND length(payload)>0 AND coalesce(json_extract(data_json,'$.result.profileProjection'),'') NOT IN ('complete','not_applicable','unknown') ORDER BY created_at,id LIMIT 100")?;
             let rows=query.query_map([],|r|r.get(0))?;Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
@@ -501,7 +596,7 @@ impl Store {
     pub fn incomplete_media_writeback(&self, account: &str) -> Result<bool> {
         self.control(account, |db| {
             Ok(db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM media_assets WHERE json_extract(metadata_json,'$.state')='available' AND coalesce(json_extract(metadata_json,'$.officialWriteback'),'') NOT IN ('complete','not_applicable')) OR EXISTS(SELECT 1 FROM media_jobs j WHERE j.kind='send' AND (j.state='accepted' OR json_extract(j.data_json,'$.serverMessageId') IS NOT NULL OR EXISTS(SELECT 1 FROM json_each(j.data_json,'$.result.chunks') c WHERE json_extract(c.value,'$.state')='accepted')) AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') NOT IN ('complete','not_applicable')) OR EXISTS(SELECT 1 FROM media_jobs WHERE kind IN ('sticker_saved','sticker_pack','sticker_send','sticker_acquire') AND (state IN ('queued','running','needs_review') OR (json_extract(data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(data_json,'$.profileWriteback'),'')!='complete')))",
+                "SELECT EXISTS(SELECT 1 FROM media_assets WHERE json_extract(metadata_json,'$.state')='available' AND coalesce(json_extract(metadata_json,'$.officialWriteback'),'') NOT IN ('complete','not_applicable')) OR EXISTS(SELECT 1 FROM media_jobs j WHERE j.kind='send' AND (j.state='accepted' OR json_extract(j.data_json,'$.serverMessageId') IS NOT NULL OR EXISTS(SELECT 1 FROM json_each(j.data_json,'$.result.chunks') c WHERE json_extract(c.value,'$.state')='accepted')) AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') NOT IN ('complete','not_applicable')) OR EXISTS(SELECT 1 FROM media_jobs WHERE kind IN ('sticker_saved','sticker_pack','sticker_send','sticker_acquire') AND (state IN ('queued','running') OR (state='needs_review' AND coalesce(error_code,'')!='review_expired') OR (length(payload)>0 AND json_extract(data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(data_json,'$.profileWriteback'),'')!='complete')))",
                 [],
                 |row| row.get(0),
             )?)
@@ -522,7 +617,7 @@ impl Store {
             };
             anyhow::ensure!(family.is_empty() || matches!(family.as_str(),"asset"|"job"),"invalid_media_repair_cursor");
             anyhow::ensure!(id.len()<=255 && !id.chars().any(char::is_control),"invalid_media_repair_cursor");
-            let mut q=db.prepare("SELECT family,id FROM (SELECT 'asset' AS family,id FROM media_assets WHERE kind IN ('image','file','video','voice') AND json_extract(metadata_json,'$.state')='available' AND coalesce(json_extract(metadata_json,'$.officialWriteback'),'') NOT IN ('complete','not_applicable') UNION ALL SELECT 'job' AS family,id FROM media_jobs WHERE kind IN ('sticker_saved','sticker_pack','sticker_send','sticker_acquire') AND json_extract(data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(data_json,'$.profileWriteback'),'')!='complete' UNION ALL SELECT 'job' AS family,id FROM media_jobs j WHERE j.kind='send' AND (j.state='accepted' OR json_extract(j.data_json,'$.serverMessageId') IS NOT NULL OR EXISTS(SELECT 1 FROM json_each(j.data_json,'$.result.chunks') c WHERE json_extract(c.value,'$.state')='accepted')) AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') NOT IN ('complete','not_applicable')) ORDER BY CASE WHEN family>?2 OR (family=?2 AND id>?3) THEN 0 ELSE 1 END,family,id LIMIT ?1")?;
+            let mut q=db.prepare("SELECT family,id FROM (SELECT 'asset' AS family,id FROM media_assets WHERE kind IN ('image','file','video','voice') AND json_extract(metadata_json,'$.state')='available' AND coalesce(json_extract(metadata_json,'$.officialWriteback'),'') NOT IN ('complete','not_applicable') UNION ALL SELECT 'job' AS family,id FROM media_jobs WHERE kind IN ('sticker_saved','sticker_pack','sticker_send','sticker_acquire') AND length(payload)>0 AND json_extract(data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(data_json,'$.profileWriteback'),'')!='complete' UNION ALL SELECT 'job' AS family,id FROM media_jobs j WHERE j.kind='send' AND (j.state='accepted' OR json_extract(j.data_json,'$.serverMessageId') IS NOT NULL OR EXISTS(SELECT 1 FROM json_each(j.data_json,'$.result.chunks') c WHERE json_extract(c.value,'$.state')='accepted')) AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') NOT IN ('complete','not_applicable')) ORDER BY CASE WHEN family>?2 OR (family=?2 AND id>?3) THEN 0 ELSE 1 END,family,id LIMIT ?1")?;
             let rows=q.query_map(params![limit,family,id],|r|Ok((r.get(0)?,r.get(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
@@ -694,8 +789,40 @@ impl Store {
             read_asset(db, &asset.id)
         })
     }
+    /// Note that a listing just returned this asset, so retention's idle
+    /// clock restarts (at most one write a day per row). Returns whether the
+    /// row exists. A read snapshot changes nothing and reports `true`.
+    pub fn touch_media_asset(&self, account: &str, id: &str) -> Result<bool> {
+        if self.is_read_snapshot() {
+            return Ok(true);
+        }
+        let now = chrono::Utc::now();
+        self.control(account, |db| {
+            let touched = db.execute(
+                "UPDATE media_assets SET updated_at=?2 WHERE id=?1 AND updated_at<?3",
+                params![
+                    id,
+                    now.to_rfc3339(),
+                    (now - chrono::Duration::days(1)).to_rfc3339()
+                ],
+            )?;
+            Ok(touched == 1
+                || db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )?)
+        })
+    }
     pub fn media_asset(&self, account: &str, id: &str) -> Result<MediaAssetRecord> {
-        self.control(account, |db| read_asset(db, id))
+        self.control(account, |db| {
+            crate::retention::expired_if_missing(
+                db,
+                crate::retention::MEDIA_ASSET_ID,
+                id,
+                read_asset(db, id),
+            )
+        })
     }
     /// Fetch cached bytes only for content reads or local writeback repair.
     /// `payload` is `None` when this store keeps no copy, which includes an
@@ -718,6 +845,32 @@ impl Store {
                 }
             };
             Ok(row)
+        })
+    }
+    /// The asset's own sealed copy opened for streaming, without reading it:
+    /// the payload file, or a payload an earlier version kept inside the
+    /// database. `None` when this store keeps no copy, which includes an
+    /// attachment read from the official profile. A deleted file is an error.
+    pub fn media_asset_payload(
+        &self,
+        account: &str,
+        id: &str,
+    ) -> Result<Option<MediaAssetPayload>> {
+        let files = self.media_directory(account)?;
+        self.control(account, |db| {
+            let (file, embedded): (Option<String>, Option<Vec<u8>>) = db.query_row(
+                "SELECT payload_file, CASE WHEN payload_file IS NULL THEN payload END FROM media_assets WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(match (file, embedded) {
+                (Some(name), _) => Some(MediaAssetPayload::File {
+                    file: media_files::open(&files, &name)?,
+                    name,
+                }),
+                (None, Some(sealed)) => Some(MediaAssetPayload::Embedded(sealed)),
+                (None, None) => None,
+            })
         })
     }
     /// Whether this store still holds the asset's own copy: an embedded payload or a payload
@@ -811,11 +964,45 @@ impl Store {
         metadata: &Value,
         payload: Option<&[u8]>,
     ) -> Result<MediaAssetRecord> {
+        match payload {
+            Some(sealed) => self.save_media_asset_streamed(account, id, metadata, |file| {
+                Ok(std::io::Write::write_all(file, sealed)?)
+            }),
+            None => self.save_media_asset_row(account, id, metadata, None),
+        }
+    }
+    /// [`Self::save_media_asset`] with a sealed payload that `fill` streams into
+    /// a new private file. The file is complete before the account database
+    /// is locked, so a large attachment does not hold up other work.
+    pub fn save_media_asset_streamed(
+        &self,
+        account: &str,
+        id: &str,
+        metadata: &Value,
+        fill: impl FnOnce(&mut std::fs::File) -> Result<()>,
+    ) -> Result<MediaAssetRecord> {
+        let files = self.media_directory(account)?;
+        let file = media_files::write_with(&files, fill)?;
+        let saved = self.save_media_asset_row(account, id, metadata, Some(&file));
+        if saved.is_err() {
+            media_files::remove(&files, &file);
+        }
+        saved
+    }
+    /// Save an asset row. `written` names a payload file already published for
+    /// it; the caller removes that file if this fails.
+    fn save_media_asset_row(
+        &self,
+        account: &str,
+        id: &str,
+        metadata: &Value,
+        written: Option<&str>,
+    ) -> Result<MediaAssetRecord> {
         let files = self.media_directory(account)?;
         self.control(account, |db| {
             let tx = db.transaction()?;
             let old = read_asset(&tx, id)?;
-            if metadata["state"] == "available" && payload.is_none() {
+            if metadata["state"] == "available" && written.is_none() {
                 let cached: bool = tx.query_row(
                     "SELECT payload IS NOT NULL OR payload_file IS NOT NULL OR profile_key IS NOT NULL FROM media_assets WHERE id=?1",
                     [id],
@@ -827,16 +1014,13 @@ impl Store {
             }
             let now = chrono::Utc::now().to_rfc3339();
             let mut replaced = None;
-            let mut written = None;
             let saved = (|| -> Result<MediaAssetRecord> {
-                if let Some(sealed) = payload {
+                if let Some(file) = written {
                     replaced = tx.query_row(
                         "SELECT payload_file FROM media_assets WHERE id=?1",
                         [id],
                         |r| r.get::<_, Option<String>>(0),
                     )?;
-                    let file = media_files::write(&files, sealed)?;
-                    written = Some(file.clone());
                     tx.execute(
                         "UPDATE media_assets SET metadata_json=?2,payload=NULL,payload_file=?3,profile_key=NULL,updated_at=?4 WHERE id=?1",
                         params![id, serde_json::to_string(metadata)?, file, now],
@@ -861,20 +1045,12 @@ impl Store {
                 tx.commit()?;
                 Ok(row)
             });
-            match committed {
-                Ok(row) => {
-                    if let Some(file) = replaced {
-                        media_files::remove(&files, &file);
-                    }
-                    Ok(row)
-                }
-                Err(error) => {
-                    if let Some(file) = written {
-                        media_files::remove(&files, &file);
-                    }
-                    Err(error)
+            if committed.is_ok() {
+                if let Some(file) = replaced.filter(|old| Some(old.as_str()) != written) {
+                    media_files::remove(&files, &file);
                 }
             }
+            committed
         })
     }
     /// Rows that still carry a payload BLOB written by an earlier version, as
@@ -938,21 +1114,52 @@ impl Store {
             media_files::sweep(&files, &referenced)
         })
     }
-    /// Return the space freed by moved or deleted payloads to the file system
-    /// once at least 16 MiB and a quarter of the database is unused. Returns
-    /// whether the database was rewritten.
+    /// Return space freed by moved or deleted payloads to the file system.
+    ///
+    /// A database not yet in incremental mode is rewritten once at least
+    /// 16 MiB and a quarter of it is unused; that rewrite also switches it to
+    /// incremental mode. Afterwards each call releases up to 64 MiB of unused
+    /// pages once 4 MiB are free, without rewriting the file. A rewrite needs
+    /// free disk space for a full copy and its journal; without it the
+    /// database is left as it is and `control_compaction_needs_space` is
+    /// returned. Returns whether space was given back.
     pub fn compact_control(&self, account: &str) -> Result<bool> {
+        const MIB: i64 = 1024 * 1024;
         if self.is_read_snapshot() {
             return Ok(false);
         }
+        let directory = self.account_dir(account)?.join("agent");
         self.control(account, |db| {
             let pages: i64 = db.pragma_query_value(None, "page_count", |r| r.get(0))?;
             let free: i64 = db.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
             let size: i64 = db.pragma_query_value(None, "page_size", |r| r.get(0))?;
-            if free.saturating_mul(size) < 16 * 1024 * 1024 || free < pages / 4 {
+            let incremental: i64 = db.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+            if incremental == 2 {
+                if free.saturating_mul(size) < 4 * MIB {
+                    return Ok(false);
+                }
+                // Each step of this statement frees one page.
+                let mut release = db.prepare(&format!(
+                    "PRAGMA incremental_vacuum({})",
+                    64 * MIB / size.max(512)
+                ))?;
+                let mut rows = release.query([])?;
+                while rows.next()?.is_some() {}
+                drop(rows);
+                drop(release);
+                checkpoint(db)?;
+                return Ok(true);
+            }
+            if free.saturating_mul(size) < 16 * MIB || free < pages / 4 {
                 return Ok(false);
             }
-            db.execute_batch("VACUUM")?;
+            let needed =
+                u64::try_from(pages.saturating_mul(size).saturating_mul(2)).unwrap_or(u64::MAX);
+            if fs2::available_space(&directory)? < needed {
+                bail!("control_compaction_needs_space");
+            }
+            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;VACUUM;")?;
+            checkpoint(db)?;
             Ok(true)
         })
     }
@@ -969,7 +1176,7 @@ impl Store {
         let before = (chrono::Utc::now() - chrono::Duration::seconds(settled_seconds)).to_rfc3339();
         self.control(account, |db| {
             let mut q = db.prepare(
-                "SELECT id,finished FROM (SELECT j.id AS id,(j.retryable=0 AND j.updated_at<=?1 AND (j.state IN ('failed','cancelled') OR (j.state='accepted' AND coalesce(json_extract(j.data_json,'$.result.profileProjection'),'') IN ('complete','not_applicable') AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') IN ('complete','not_applicable')))) AS finished,json_extract(j.data_json,'$.sourceId') AS source FROM media_jobs j WHERE j.kind='send') WHERE finished=0 OR EXISTS(SELECT 1 FROM media_sources s WHERE s.id=source) ORDER BY id",
+                "SELECT id,finished FROM (SELECT j.id AS id,(j.retryable=0 AND j.updated_at<=?1 AND (j.state IN ('failed','cancelled') OR (j.state='needs_review' AND coalesce(j.error_code,'')='review_expired') OR (j.state='accepted' AND coalesce(json_extract(j.data_json,'$.result.profileProjection'),'') IN ('complete','not_applicable') AND coalesce(json_extract(j.data_json,'$.result.officialMediaWriteback'),'') IN ('complete','not_applicable')))) AS finished,json_extract(j.data_json,'$.sourceId') AS source FROM media_jobs j WHERE j.kind='send') WHERE finished=0 OR EXISTS(SELECT 1 FROM media_sources s WHERE s.id=source) ORDER BY id",
             )?;
             let rows = q.query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -986,7 +1193,7 @@ impl Store {
         anyhow::ensure!(settled_seconds >= 0, "invalid_limit");
         let before = (chrono::Utc::now() - chrono::Duration::seconds(settled_seconds)).to_rfc3339();
         self.control(account, |db| {
-            let mut query = db.prepare("SELECT json_extract(data_json,'$.sourceId'), (retryable=0 AND updated_at<=?1 AND (state IN ('failed','cancelled','unsupported','expired') OR (state='available' AND (kind='sticker_prepare' OR json_extract(data_json,'$.profileWriteback')='complete'))) AND (coalesce(json_extract(data_json,'$.serverAcceptance'),'')!='accepted' OR coalesce(json_extract(data_json,'$.profileWriteback'),'')='complete')) FROM media_jobs WHERE kind IN ('sticker_prepare','sticker_send') AND json_type(data_json,'$.sourceId')='text'")?;
+            let mut query = db.prepare("SELECT json_extract(data_json,'$.sourceId'), (retryable=0 AND updated_at<=?1 AND (((state IN ('failed','cancelled','unsupported','expired') OR (state='available' AND (kind='sticker_prepare' OR json_extract(data_json,'$.profileWriteback')='complete'))) AND (coalesce(json_extract(data_json,'$.serverAcceptance'),'')!='accepted' OR coalesce(json_extract(data_json,'$.profileWriteback'),'')='complete')) OR (state='needs_review' AND coalesce(error_code,'')='review_expired'))) FROM media_jobs WHERE kind IN ('sticker_prepare','sticker_send') AND json_type(data_json,'$.sourceId')='text'")?;
             let rows = query.query_map([before], |r| Ok((r.get(0)?,r.get(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
@@ -1005,7 +1212,7 @@ impl Store {
         self.control(account, |db| {
             let tx = db.transaction()?;
             let expired = {
-                let mut query = tx.prepare("SELECT a.id,a.payload_file,a.metadata_json FROM media_assets a WHERE json_extract(a.metadata_json,'$.preparationExpiresAt')<=?1 AND json_extract(a.metadata_json,'$.state')='available' AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE json_extract(j.data_json,'$.preparationId')=json_extract(a.metadata_json,'$.jobId') AND (j.state IN ('queued','running','needs_review') OR j.retryable=1 OR (j.kind IN ('sticker_saved','sticker_acquire') AND json_extract(j.data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(j.data_json,'$.profileWriteback'),'')!='complete'))) LIMIT ?2")?;
+                let mut query = tx.prepare("SELECT a.id,a.payload_file,a.metadata_json FROM media_assets a WHERE json_extract(a.metadata_json,'$.preparationExpiresAt')<=?1 AND json_extract(a.metadata_json,'$.state')='available' AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE json_extract(j.data_json,'$.preparationId')=json_extract(a.metadata_json,'$.jobId') AND (j.state IN ('queued','running') OR (j.state='needs_review' AND coalesce(j.error_code,'')!='review_expired') OR j.retryable=1 OR (j.kind IN ('sticker_saved','sticker_acquire') AND length(j.payload)>0 AND json_extract(j.data_json,'$.serverAcceptance')='accepted' AND coalesce(json_extract(j.data_json,'$.profileWriteback'),'')!='complete'))) LIMIT ?2")?;
                 let rows = query.query_map(params![now,limit], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?)))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
@@ -1019,14 +1226,11 @@ impl Store {
             Ok(expired.len())
         })
     }
+    /// Retained message batches for the voice fallback: the same bounded window
+    /// as recall evidence. Older batches have already written their inline
+    /// voice to the profile, and retention drops their payloads.
     pub fn media_sync_receipts(&self, account: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        self.control(account, |db| {
-            let mut q = db.prepare(
-                "SELECT id,payload FROM apply_intents WHERE stream='message' ORDER BY created_at DESC,id DESC LIMIT 10000",
-            )?;
-            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
-        })
+        self.recent_message_batches(account)
     }
 }
 
@@ -1039,6 +1243,145 @@ mod tests {
         s.create_account("test").unwrap();
         (t, s)
     }
+    #[test]
+    fn progress_updates_replace_the_previous_progress_event_without_reusing_sequences() {
+        let (_dir, s) = setup();
+        // An unrelated first event, so the job's events are never the oldest.
+        s.append_event_once("test", "first", "account.push", &json!({}))
+            .unwrap();
+        let (mut row, _) = s
+            .create_media_job(
+                "test",
+                "job",
+                "download:asset",
+                &"0".repeat(64),
+                "download",
+                &json!({"assetId":"asset","completedBytes":0}),
+                b"",
+            )
+            .unwrap();
+        let mut seen = 0;
+        let mut save = |row: &mut MediaJobRecord, change: &dyn Fn(&mut MediaJobRecord)| {
+            change(row);
+            *row = s.save_media_job("test", row).unwrap();
+            let events = s.events("test", 0, 200).unwrap();
+            let newest: i64 = events.last().unwrap().cursor.parse().unwrap();
+            assert!(newest > seen, "sequence reused");
+            seen = newest;
+            events
+                .into_iter()
+                .filter(|event| event.kind == "job.updated")
+                .map(|event| {
+                    (
+                        event.data["state"].clone(),
+                        event.data["completedBytes"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        save(&mut row, &|row| row.state = "running".into());
+        let running_cursor = s
+            .events("test", 0, 200)
+            .unwrap()
+            .last()
+            .unwrap()
+            .cursor
+            .parse::<i64>()
+            .unwrap();
+        for bytes in [10, 20, 30] {
+            save(&mut row, &|row| row.data["completedBytes"] = bytes.into());
+        }
+        let events = save(&mut row, &|row| row.state = "available".into());
+        // One event per state: progress replaced its predecessor, including
+        // the running transition, whose state the newest progress repeats.
+        assert_eq!(
+            events,
+            vec![
+                (json!("queued"), json!(0)),
+                (json!("running"), json!(30)),
+                (json!("available"), json!(30)),
+            ]
+        );
+        // A reader whose cursor is the deleted running event still gets the
+        // newer progress event and the completion.
+        let later = s.events("test", running_cursor, 200).unwrap();
+        assert_eq!(
+            later
+                .iter()
+                .map(|event| event.data["state"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("running"), json!("available")]
+        );
+    }
+
+    #[test]
+    fn the_log_keeps_its_row_limit_when_merged_progress_leaves_gaps() {
+        let (_dir, s) = setup();
+        let (mut row, _) = s
+            .create_media_job(
+                "test",
+                "job",
+                "download:asset",
+                &"0".repeat(64),
+                "download",
+                &json!({"assetId":"asset","completedBytes":0}),
+                b"",
+            )
+            .unwrap();
+        let bulk = |count: i64| {
+            s.control("test", |db| {
+                let tx = db.transaction()?;
+                for n in 0..count {
+                    tx.execute(
+                        "INSERT INTO events VALUES((SELECT MAX(sequence)+1 FROM events),'account.push',?1,'2026-01-01T00:00:00+00:00')",
+                        [format!("{{\"n\":{n}}}")],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        bulk(9_000);
+        // Progress saves use up sequence numbers but leave one row, so the
+        // window would hold fewer rows if it were cut by sequence distance.
+        for bytes in 1..=300 {
+            row.data["completedBytes"] = bytes.into();
+            row = s.save_media_job("test", &row).unwrap();
+        }
+        bulk(1_500);
+        row.data["completedBytes"] = 301.into();
+        s.save_media_job("test", &row).unwrap();
+        let count: i64 = s
+            .control("test", |db| {
+                Ok(db.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(count, crate::EVENT_LIMIT);
+    }
+
+    #[test]
+    fn the_oldest_event_is_never_merged_away() {
+        let (_dir, s) = setup();
+        let (mut row, _) = s
+            .create_media_job(
+                "test",
+                "job",
+                "download:asset",
+                &"0".repeat(64),
+                "download",
+                &json!({"assetId":"asset","completedBytes":0}),
+                b"",
+            )
+            .unwrap();
+        let first: i64 = s.events("test", 0, 10).unwrap()[0].cursor.parse().unwrap();
+        row.data["completedBytes"] = 5.into();
+        s.save_media_job("test", &row).unwrap();
+        // Deleting the first event would make a cursor just before it expire.
+        assert!(s.events("test", first - 1, 10).is_ok());
+        assert_eq!(s.events("test", 0, 10).unwrap().len(), 2);
+    }
+
     #[test]
     fn compaction_returns_space_once_embedded_payloads_have_moved_to_files() {
         let (dir, s) = setup();

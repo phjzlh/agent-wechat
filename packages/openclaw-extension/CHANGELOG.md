@@ -1,5 +1,53 @@
 # @agent-wechat/wechat
 
+## 2.7.1
+
+### Patch Changes
+
+- [#583](https://github.com/thisnick/agent-wechat/pull/583) [`8e645ed`](https://github.com/thisnick/agent-wechat/commit/8e645ede3566fd6f4038b18bacac6955bed41c76) Thanks [@thisnick](https://github.com/thisnick)! - The owner-only `wechat_contacts` and `wechat_contact_request` tools now work for agents that run through a CLI backend such as Claude CLI. OpenClaw doesn't tell tools in those runs whether the chat is private, so the tools were never offered, even in the owner's own chat. When OpenClaw supplies no such answer, the plugin now checks the stored session itself: it must be the current direct chat, keyed by and replying to the owner. Groups, scheduled runs, sub-agents, other people's chats and the shared `main` direct-chat session still don't get the tools, and every call checks the session again before it acts and before it returns. When OpenClaw does supply an answer, that answer still decides.
+
+- [#585](https://github.com/thisnick/agent-wechat/pull/585) [`77e8466`](https://github.com/thisnick/agent-wechat/commit/77e8466e956c05131caa45598611c46b4b1ca7f4) Thanks [@thisnick](https://github.com/thisnick)! - The OpenClaw plugin keeps its place with the event cursor instead of a copy of every message, and catches up on missed messages from the last 24 hours.
+
+  - **No message copies.** `consumerStateDir` now holds the event cursor, the identities of messages still being handled, pending thread reads and each group's context boundary. Finished messages and recalls are no longer stored; the daemon commits each message once and applies recalls to the profile.
+  - **Upgrading.** The first start converts the file an earlier release wrote. It keeps the cursor, pending reads and each group's context position, so nothing is replayed and the next mention sees the same context. Messages the earlier release still had queued are kept if they are live, incoming and sent in the last 24 hours, and at the first start they count toward the catch-up limit of 100 only if the current policy would answer them; a turn it left interrupted is logged and not repeated. The original file stays beside the new one with a `.v1-backup` suffix. An earlier release cannot read the converted file; restoring the backup makes it handle again the messages that arrived since the upgrade.
+  - **Catching up.** After a restart the plugin answers messages that were sent and reached the daemon in the last 24 hours, at most the newest 100 that the current sender, group, mention and command policy would answer, counting messages already queued. Older or excess messages are skipped and logged. A new consumer directory, or a cursor the daemon no longer keeps, resumes at the start of the last 24 hours instead of replaying the event log or stopping. A large backlog no longer fills the queue and stops intake.
+  - **Group context** for a mention is read from the chat's saved messages, back to the last message handed to the model in that group, with the same sender and recall checks. It can now include messages from before the plugin started, up to `messages.groupChat.historyLimit`; it still leaves out the account's own messages and commands.
+  - A turn that was in progress when the Gateway stopped is logged at the next start and not repeated, as before.
+
+## 2.7.0
+
+### Minor Changes
+
+- [#562](https://github.com/thisnick/agent-wechat/pull/562) [`8208b47`](https://github.com/thisnick/agent-wechat/commit/8208b474e2794561f74dafd9d58088c120adedb0) Thanks [@thisnick](https://github.com/thisnick)! - Add account-bound contact discovery and friend request history, sending, acceptance, local history deletion and contact removal through the Rust libraries, HTTP API and CLI. Add optional private-owner OpenClaw contact tools and unified contact, group and message search in the client UI.
+
+## 2.6.0
+
+### Minor Changes
+
+- [#541](https://github.com/thisnick/agent-wechat/pull/541) [`49d3614`](https://github.com/thisnick/agent-wechat/commit/49d36143a1b7dd5e4f11330b6ef12e86eea40ca1) Thanks [@thisnick](https://github.com/thisnick)! - The desktop app's local hub now runs only while the app needs it. It runs while **This device** is selected and stops when you switch to another hub, unless the new **Settings → Keep this device’s hub running** option is on; turn that on if the `wx` command or another app used this device's hub while the window showed a remote hub. Quitting with ⌘Q, from the Dock or by logging out now stops the hub too; before, only **Quit AgentWechat** in the tray or menu bar did, and the other ways left the hub running and holding its port. If an earlier session left its hub running, the app says so instead of failing to open the selected hub, and offers **Stop leftover hub**, which checks that the hub uses this app's data and key before stopping it.
+
+  `wx serve --exit-with-parent` stops the daemon gracefully once the process that started it exits, and `wx --json version` lists it as the `serve-exit-with-parent` capability. The desktop app starts its hub with it, so a crash or forced quit no longer leaves the hub behind. OpenClaw managed mode passes it too when the `wx` it finds reports that capability, so a Gateway that crashes or is killed no longer leaves its daemon holding the port; an older `wx` starts as before.
+
+### Patch Changes
+
+- [#545](https://github.com/thisnick/agent-wechat/pull/545) [`b2016e6`](https://github.com/thisnick/agent-wechat/commit/b2016e6ea1ce9810b202c7c689c30f7374bac001) Thanks [@thisnick](https://github.com/thisnick)! - Renaming a contact on the phone now updates their remark in profiles the daemon created (#483). The daemon no longer drops remarks that WeChat sends with a version marker: when a remark change arrives it looks the contact up again and saves the current remark, and `wx contacts refresh` saves it too. Remark changes now also arrive while the daemon is connected instead of only after it reconnects. To fill in remarks that are missing from before this update, run `wx contacts sync` or refresh the contact.
+
+- [#542](https://github.com/thisnick/agent-wechat/pull/542) [`3060ac9`](https://github.com/thisnick/agent-wechat/commit/3060ac9753ac8438f3deaa9f6096d8b53b33fd9c) Thanks [@thisnick](https://github.com/thisnick)! - New profiles the daemon creates now keep their databases in WAL mode, as the official client does, and the daemon converts existing profiles it created from the rollback journal to WAL at startup. Reads on these profiles no longer wait behind sync writes (#537). Attached official profiles are never converted.
+
+- [#544](https://github.com/thisnick/agent-wechat/pull/544) [`9be8fdc`](https://github.com/thisnick/agent-wechat/commit/9be8fdc17a975374e45937e0e02806c964601afd) Thanks [@huoxiaqujiuhao](https://github.com/huoxiaqujiuhao)! - Full-range videos (for example `yuvj420p`, or `yuv420p` tagged `color_range=pc`) can now be sent at normal quality on hosts with FFmpeg 7 or later. The playback copy is converted to limited range; before, it kept the source's full range and the daemon rejected its own copy with `media_processing_failed`.
+
+- [#538](https://github.com/thisnick/agent-wechat/pull/538) [`d3e6c72`](https://github.com/thisnick/agent-wechat/commit/d3e6c72f5ab92ca580297d757cbafc57f3722650) Thanks [@thisnick](https://github.com/thisnick)! - Validate the OpenClaw integration against 2026.11.4. No plugin changes were needed; the pinned Gateway and model-handoff smokes pass unchanged.
+
+- [#551](https://github.com/thisnick/agent-wechat/pull/551) [`a0e517d`](https://github.com/thisnick/agent-wechat/commit/a0e517db949cf28b03273f0cecfb0534fee5b3c7) Thanks [@thisnick](https://github.com/thisnick)! - The OpenClaw plugin no longer holds a received file or video in the gateway's memory. Files of any size and videos now stream from the daemon into OpenClaw's media store, checked against their size and SHA-256 as they are written; before, files up to 128 MiB and every video were read whole first. Images, voice notes and stickers are unchanged. Videos are still offered to the agent as media, and the 128 MiB video limit is unchanged.
+
+- [#548](https://github.com/thisnick/agent-wechat/pull/548) [`74d4fcb`](https://github.com/thisnick/agent-wechat/commit/74d4fcb1c0eb63a1446e667fae3d86115a06cc1c) Thanks [@thisnick](https://github.com/thisnick)! - Sending, downloading and serving large files and original-quality videos no longer loads them into the daemon's memory (#529). A send reads its upload from a private temporary file and encrypts each CDN chunk as it goes; a download decrypts each piece into a temporary file; both write the official profile and the daemon's encrypted copy from that file. `GET /media/{id}/content` streams the file, and a `Range` request reads only its range once the whole file was checked. A 512 MiB send or download now stays within a small, fixed amount of memory instead of needing several hundred MB.
+
+  `wechat-protocol` adds `PreparedFileUpload` with `CdnClient::upload_file_with_progress`, `upload_large_file_from_file_with_progress` and `upload_video_original_from_file_with_progress`, plus `download_to_with_progress`, `DownloadReceipt` and `DownloadedMedia::into_parts` for downloads into a writer. `wechat-profile` adds `MediaPayload`, `cache_file_projection_payload`, `cache_video_projection_payload`, `publish_cache_payload` and `ProfileReader::verified_hardlink_file`. Existing APIs are unchanged.
+
+- [#544](https://github.com/thisnick/agent-wechat/pull/544) [`8af4eda`](https://github.com/thisnick/agent-wechat/commit/8af4eda9f78c729346117ba33ce3dcff9178017b) Thanks [@huoxiaqujiuhao](https://github.com/huoxiaqujiuhao)! - Videos with more than one audio track, or with embedded cover art, can now be sent at normal quality. The playback copy uses the first audio track and ignores the cover image; before, these sources failed with `media_processing_failed`. The original upload is unchanged.
+
+- [#550](https://github.com/thisnick/agent-wechat/pull/550) [`34ad3ca`](https://github.com/thisnick/agent-wechat/commit/34ad3ca7177df31075855e6d0e50f11122792bd2) Thanks [@thisnick](https://github.com/thisnick)! - Videos recorded on an iPhone can now be sent. Their timed-metadata tracks no longer count toward the source's stream limit, so a recording with several of them no longer fails with `media_processing_failed`; the playback copy still uses one video and one audio stream and leaves the metadata out.
+
 ## 2.5.0
 
 ### Minor Changes

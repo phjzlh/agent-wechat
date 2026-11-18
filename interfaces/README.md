@@ -17,7 +17,7 @@ These files list every public interface of agent-wechat, one item per line, gene
 | `ui/scenes.txt` | The screens captured for visual review, each with its route and viewports | `pnpm --filter @agent-wechat/client-ui scenes:list` |
 | `storage/registry.txt` | The SQL schema of the daemon's `registry.sqlite`, plus a hash of every migration file | `packages/native-client-rust/crates/wechat-store/src/schema_interface_tests.rs` |
 
-Official WeChat profile databases belong to WeChat, not to this project, so they aren't listed. The event stream's per-kind payloads aren't listed yet. Screenshots aren't committed: CI captures every scene in `scenes.txt` and uploads it to [Argos](https://app.argos-ci.com/thisnick/agent-wechat), which compares it with the latest `main` build and adds a check to the PR. Approving the changes in Argos is the visual sign-off; the merged `main` build becomes the next baseline. Their request and response types are checked separately by `scripts/native-generate-types.sh --check`.
+Official WeChat profile databases belong to WeChat, not to this project, so they aren't listed. The event stream's per-kind payloads aren't listed yet. Screenshots aren't committed: CI captures every scene in `scenes.txt` and uploads it to [Argos](https://app.argos-ci.com/thisnick/agent-wechat), which compares it with the latest `main` build and adds a check to the PR. Approving the changes in Argos is the visual sign-off; the merged `main` build becomes the next baseline. Their request and response types are checked separately by `scripts/generate-types.sh --check`.
 
 ## Update the listings
 
@@ -35,11 +35,14 @@ git diff interfaces/     # review what changed
 | `pnpm interfaces cli http` | Only the named listings: `cli`, `storage`, `websocket`, `http`, `ui`, `crates`, `openclaw` |
 | `pnpm interfaces --all` | Every listing |
 | `pnpm interfaces --list` | Shows each listing and whether its sources changed |
-| `--check` with any of the above | Compares instead of writing. CI runs `pnpm interfaces --check --all` |
+| `pnpm interfaces --affected` | Prints the names a run would check, one per line, without running them |
+| `--check` with any of the above | Compares instead of writing |
 
 Each run prints how long each listing took. With warm build caches a full run takes about 5 seconds; the first run in a fresh checkout compiles the Rust test and rustdoc builds and takes a few minutes. The Rust listings run as one cargo invocation, and the crate listings use their own target directory (`target/interfaces-rustdoc`), so neither forces the other to rebuild.
 
 `pnpm interfaces --check` fails instead of writing. It needs the pinned Rust toolchain, `cmake` and Node. The CLI and storage listings are also checked by `cargo test`.
+
+In CI, the Interfaces up to date job checks each listing only when a PR changes its sources, using the same paths as `pnpm interfaces`. It installs only what those listings need: Node for `ui` and `scenes`, `pnpm install` for `openclaw`, and Rust and `cmake` for the rest. A PR that changes no listing's sources passes without building anything.
 
 ## Format
 
@@ -63,7 +66,7 @@ tool wechat_history.limit | integer, min 1, max 50, default 20 | Maximum number 
 
 | Check | Fails when |
 | --- | --- |
-| Interfaces up to date | A generator's output differs from the committed listing |
+| Interfaces up to date | A listing whose sources the PR changed differs from its generator's output |
 | Interface docs | A row added or changed in this PR says `MISSING …`. Gaps from before a listing existed stay allowed until someone fixes them |
 | Interface approval | The PR changes `interfaces/` and the `interfaces-approved` label doesn't cover the current listings |
 

@@ -11,6 +11,7 @@ This repository provides a standalone native WeChat daemon, Rust CLI and OpenCla
 | `packages/cli/` | npm `wx` launcher and verified executable installer |
 | `packages/openclaw-extension/` | OpenClaw native hosting, event custody, model handoff and media |
 | `deploy/native/` | Native-only image, Compose and optional user-service examples |
+| `scripts/` | Repository tooling: CI helpers, release scripts, cross-package smoke tests, translation and interface tooling. See `scripts/AGENTS.md` |
 | `docs/` | Public documentation site |
 
 Native routes/contracts live in `packages/native-client-rust/crates/wechat-api/`; run `pnpm generate-types` after exported Rust contract changes. The README is a concise user guide, not an exhaustive API specification. The former UI server, image, container CLI and Wechaty integrations are retired; Git history retains their implementation.
@@ -39,6 +40,16 @@ Native routes/contracts live in `packages/native-client-rust/crates/wechat-api/`
 - UI changes are reviewed visually: CI uploads every scene to Argos, and the owner approves the changes there. Add or update a scene in `packages/client-ui/scenes/` when you add or change a screen. Never approve Argos changes yourself.
 - A PR that changes `interfaces/` needs the owner's `interfaces-approved` label. Never add that label yourself, and never merge while the Interface approval check is pending or failing.
 
+## Pull request review
+
+An independent Claude reviewer posts inline comments and one summary comment, with a confidence score, on pull requests (`.github/workflows/claude-code-review.yml`; what it checks is in `.github/claude-review/instructions.md`). It runs when a pull request from a branch of this repository is opened ready for review, marked ready or reopened, and whenever the `claude-review` label is added. Pushes alone don't start it.
+
+- Before opening a PR, have a fresh agent review the diff, one with none of your session's context: in Claude Code, run `/code-review` on the branch; with other agents, start a new session or subagent given only the diff and this guide. Fix what it finds, or say in the PR why not.
+- Answer every finding from the Claude review: fix it or reply with the reason, then resolve the thread. Fix a Pre-existing finding if it's small; otherwise open an issue for it.
+- After pushing fixes, add the `claude-review` label once to have the new commits reviewed, not after every push. On a fork's PR, it takes someone with write access to the repository.
+- Fill in the template's "Risk and rollback" section. Say plainly when installing the previous version would not undo the change, for example after a new migration or a changed stored format.
+- When a bug gets past review and turns up later, in a lab test, from a user or in production, add what the reviewer would have needed to know to this guide or to the review instructions.
+
 ## Documentation site
 
 `docs/` is for people setting it up, people using it from the CLI, OpenClaw or their own code, and people who want to know how it works. When a change affects users, update the one page that owns the topic; don't append a paragraph to whichever page is nearest.
@@ -47,7 +58,7 @@ Native routes/contracts live in `packages/native-client-rust/crates/wechat-api/`
 - Write plain sentences for a reader who hasn't seen the code. Avoid "explicit", "bounded", "durable", "custody", "projection" and similar internal terms unless the page defines them.
 - Prefer a table, diagram (a `mermaid` code block, rendered at build time) or example over a paragraph.
 - Keep task pages short, roughly 600 words; split a page that grows past that.
-- Internal test evidence, CI scripts and release mechanics belong in `RELEASING.md`, `PLATFORM-ACCEPTANCE.md` or `deploy/native/README.md`, not in the `docs/` site.
+- Internal test evidence, CI scripts and release mechanics belong in `RELEASING.md` or `deploy/native/README.md`, not in the `docs/` site.
 - Moving or renaming a page needs an entry in `moved` in `docs/astro.config.mjs` so old links keep working.
 
 ## Runtime boundaries
@@ -128,7 +139,7 @@ cargo +1.93.1 fmt --all --manifest-path packages/native-client-rust/Cargo.toml
 cargo +1.93.1 fmt --all --check --manifest-path packages/native-client-rust/Cargo.toml
 cargo +1.93.1 clippy --workspace --all-targets --locked --manifest-path packages/native-client-rust/Cargo.toml -- -D warnings
 cargo +1.93.1 test --workspace --locked --manifest-path packages/native-client-rust/Cargo.toml
-bash scripts/native-generate-types.sh --check
+bash scripts/generate-types.sh --check
 pnpm interfaces --check
 ```
 
