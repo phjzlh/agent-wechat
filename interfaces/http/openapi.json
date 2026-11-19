@@ -1729,6 +1729,38 @@
               "null"
             ]
           },
+          "privacy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeContactPrivacySettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current relationship settings, when available for this friend."
+          },
+          "privacyPending": {
+            "description": "True while an accepted relationship edit is awaiting contact sync.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "privacyUnavailable": {
+            "description": "Why a friend has no `privacy` or `privacyVersion`, so it can't be edited yet:\n`contact_privacy_unresolved` (refresh the contact),\n`ordinary_contact_required` (not supported for this contact),\n`profile_identity_unavailable` or `contact_flags_unresolved`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "privacyVersion": {
+            "description": "Version to send as `expectedVersion` when changing this contact's privacy\nor remark. It changes when the privacy or the relationship changes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "relation": {
             "description": "Relationship evidence: `friend` when membership is established, `non_contact` when\nknown flags do not establish membership, or `unknown` when flags are unavailable.",
             "type": "string"
@@ -1737,6 +1769,13 @@
             "description": "Your private name for the contact. Null when none is saved.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "remarkPending": {
+            "description": "True while the remark is being fetched from WeChat after it changed, from\nthis account or another device. Edits are still accepted meanwhile.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -1795,24 +1834,6 @@
           "coverage",
           "sourceGeneration",
           "asOfEventCursor"
-        ],
-        "type": "object"
-      },
-      "NativeContactPrivacy": {
-        "description": "Current relationship privacy read from the supported official profile.",
-        "properties": {
-          "privacy": {
-            "$ref": "#/components/schemas/NativeContactPrivacySettings",
-            "description": "Current settings for this account's relationship."
-          },
-          "version": {
-            "description": "Account/contact-bound version required when saving a change.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "privacy",
-          "version"
         ],
         "type": "object"
       },
@@ -2170,16 +2191,29 @@
         "description": "Update supported contact settings after inspecting their current version.",
         "properties": {
           "expectedVersion": {
-            "description": "Version returned by the privacy read on this account.",
+            "description": "Version from the contact's `privacyVersion` on this account.",
             "type": "string"
           },
           "privacy": {
-            "$ref": "#/components/schemas/NativeContactPrivacySettings",
-            "description": "Desired settings; unrelated contact flags are preserved."
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeContactPrivacySettings"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Desired relationship settings; unrelated contact flags are preserved.\nSend either `privacy` or `remark` in one request."
+          },
+          "remark": {
+            "description": "New personal remark: a string sets it, `null` clears it, and omitting\nit keeps the current remark. Outer whitespace is removed.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "privacy",
           "expectedVersion"
         ],
         "type": "object"
@@ -6342,7 +6376,7 @@
             ]
           }
         ],
-        "summary": "List the saved contacts.",
+        "summary": "List contacts and their relationship privacy when available.",
         "tags": [
           "contacts"
         ],
@@ -6523,7 +6557,7 @@
             ]
           }
         ],
-        "summary": "Show one saved contact.",
+        "summary": "Show one contact and its relationship privacy when available.",
         "tags": [
           "contacts"
         ],
@@ -6601,72 +6635,13 @@
             ]
           }
         ],
-        "summary": "Change relationship privacy against the inspected version.",
+        "summary": "Change relationship privacy or the remark against the inspected version.",
         "tags": [
           "contacts"
         ],
         "x-agent-wechat-sdk-response": [
           {
             "$ref": "#/components/schemas/NativeOperation"
-          }
-        ]
-      }
-    },
-    "/v1/accounts/{a}/contacts/{id}/privacy": {
-      "get": {
-        "operationId": "contactPrivacy",
-        "parameters": [
-          {
-            "description": "Account ID or alias.",
-            "in": "path",
-            "name": "a",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Contact ID.",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NativeContactPrivacy"
-                }
-              }
-            },
-            "description": "Success."
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "security": [
-          {
-            "bearer": [
-              "admin"
-            ]
-          }
-        ],
-        "summary": "Read current relationship privacy from the official profile.",
-        "tags": [
-          "contacts"
-        ],
-        "x-agent-wechat-sdk-response": [
-          {
-            "$ref": "#/components/schemas/NativeContactPrivacy"
           }
         ]
       }
@@ -6718,7 +6693,7 @@
             ]
           }
         ],
-        "summary": "Ask WeChat for the latest details of one contact. Poll the returned operation.",
+        "summary": "Ask WeChat for the latest contact details and privacy. Poll the returned operation.",
         "tags": [
           "contacts"
         ],

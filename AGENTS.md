@@ -31,6 +31,9 @@ Native routes/contracts live in `packages/native-client-rust/crates/wechat-api/`
 
 ## Public interfaces
 
+- Design HTTP APIs around resources. Default to `/v1/accounts/{account}/{resource}` for an account's collection and `/v1/accounts/{account}/{resource}/{id}` for an item. Use standard methods for reads, creation, partial updates and removal.
+- Return a resource's related fields in its collection and detail representations where practical. Keep cache and upstream fetching behind the API, and refresh related fields together. Avoid parallel roots and operation-specific read routes such as `/contact-privacy/snapshots` for fields that belong to `/contacts`. Add a separate resource or action route when it has a distinct lifecycle or no clear standard method.
+
 `interfaces/` lists every public interface, generated from the code: `wx` commands and flags, the published crates' APIs, the OpenClaw tools and configuration, the HTTP API routes and payloads, the calls WebSocket messages, the UI's URLs, and the SQL schema of the account and registry stores. See `interfaces/README.md`.
 
 - **Every PR must run `pnpm interfaces`** before it is opened and before each later push, and commit whatever it changes under `interfaces/`. By default it runs only the listings whose sources changed; name listings (`pnpm interfaces http ui`) or pass `--all` to choose. The submitter generates the listings: CI only regenerates them to compare, fails when the committed files differ, and never commits them.
@@ -47,8 +50,18 @@ An independent Claude reviewer posts inline comments and one summary comment, wi
 - Before opening a PR, have a fresh agent review the diff, one with none of your session's context: in Claude Code, run `/code-review` on the branch; with other agents, start a new session or subagent given only the diff and this guide. Fix what it finds, or say in the PR why not.
 - Answer every finding from the Claude review: fix it or reply with the reason, then resolve the thread. Fix a Pre-existing finding if it's small; otherwise open an issue for it.
 - After pushing fixes, add the `claude-review` label once to have the new commits reviewed, not after every push. On a fork's PR, it takes someone with write access to the repository.
+- After you push a PR, stay with it while its workflows run, if your environment can watch them (a fork's PR needs approval before its workflows run). Wait for the checks and the Claude review, fix CI failures, and answer the review as above. If no review starts on its own (draft, bot-opened and fork PRs), add the `claude-review` label if you can; otherwise ask the maintainer in a PR comment. Interface approval and Argos wait for the owner, so list them in your summary instead of trying to fix them. The first review is round one, and each push of fixes plus one `claude-review` label starts the next. Stop after three rounds and summarize any open findings in a PR comment for the maintainer.
 - Fill in the template's "Risk and rollback" section. Say plainly when installing the previous version would not undo the change, for example after a new migration or a changed stored format.
 - When a bug gets past review and turns up later, in a lab test, from a user or in production, add what the reviewer would have needed to know to this guide or to the review instructions.
+
+## Videos of UI changes
+
+Make a video of the client UI only when the user asks for one, or when the task is to build or fix a specific use case in the UI. A video shows the flow over time against the simulator; it does not replace the Argos scenes.
+
+1. Copy `packages/client-ui/journeys/reply-in-chat.journey.mjs` to `journeys/<name>.journey.mjs` and script the use case: what to seed, which screen to open, the clicks and typing, and any simulator events. "Videos of the UI" in `packages/client-ui/README.md` lists the fields and helpers.
+2. Record it with `pnpm --filter @agent-wechat/client-ui videos <name>`. Check the `-frames.png` contact sheet to confirm it shows the use case, and fix the journey until it does. Give the user the MP4 if your environment can send files.
+3. Commit and push the journey. The UI screenshots workflow records it after the scenes, reusing its simulator build, and posts it in a PR comment.
+4. Once the comment shows the video, delete the journey file in a new commit. Journeys are not kept in the repository unless the user asks; the comment keeps working without the file. To refresh the video after later changes, add the journey back the same way.
 
 ## Documentation site
 
